@@ -1,0 +1,12 @@
+$timescale 10 ps $end
+$scope module tb $end
+$var wire 1 ! sig $end
+$upscope $end
+$enddefinitions $end
+$dumpvars
+0!
+$end
+#1
+1!
+#2
+0!

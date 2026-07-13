@@ -1,0 +1,846 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, TextIO
+import gzip
+import hashlib
+import os
+import re
+import sqlite3
+import time
+
+from .timeparse import Timescale
+
+_SCHEMA_VERSION = 2
+_UNIT_RE = re.compile(r"\b(1|10|100)\s*(fs|ps|ns|us|ms|s)\b", re.IGNORECASE)
+_INDEX_LEVELS = ("metadata", "changes", "runs", "edges")
+
+@dataclass(frozen=True)
+class SignalDef:
+    signal_id: int
+    id_code: str
+    full_path: str
+    scope: str
+    leaf: str
+    kind: str
+    width: int
+
+@dataclass(frozen=True)
+class BuildStats:
+    db_path: Path
+    signal_count: int
+    change_count: int
+    run_count: int
+    edge_count: int
+    min_tick: int
+    max_tick: int
+    build_seconds: float
+    source_size_bytes: int
+    size_class: str = "small"
+    built_level: str = "full"
+    reused: bool = False
+
+
+def size_class_for_bytes(size: int) -> str:
+    mb = size / (1024 * 1024)
+    if mb < 10:
+        return "small"
+    if mb < 50:
+        return "medium"
+    if mb <= 250:
+        return "large"
+    return "huge"
+
+
+def connect(db_path: str | Path, readonly: bool = False) -> sqlite3.Connection:
+    path = Path(db_path)
+    if readonly:
+        uri = f"file:{path}?mode=ro"
+        con = sqlite3.connect(uri, uri=True)
+    else:
+        con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    if not readonly:
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA temp_store=MEMORY")
+    return con
+
+
+def default_cache_dir_for(vcd_path: str | Path) -> Path:
+    p = Path(vcd_path).resolve()
+    return p.parent / ".waveq_cache"
+
+
+def cache_path_for(vcd_path: str | Path, cache_dir: str | Path | None = None) -> Path:
+    p = Path(vcd_path).resolve()
+    key = f"{p}\0{_SCHEMA_VERSION}".encode()
+    digest = hashlib.sha256(key).hexdigest()[:16]
+    name = p.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if name.endswith(".vcd"):
+        name = name[:-4]
+    root = Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir_for(p)
+    return root / f"{name}.{digest}.waveq.sqlite"
+
+
+def is_cache_valid(db_path: str | Path, vcd_path: str | Path) -> bool:
+    db = Path(db_path)
+    src = Path(vcd_path).resolve()
+    if not db.exists():
+        return False
+    try:
+        con = connect(db, readonly=True)
+        try:
+            meta = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM meta")}
+        finally:
+            con.close()
+        st = src.stat()
+        return (
+            meta.get("schema_version") == str(_SCHEMA_VERSION)
+            and meta.get("source_path") == str(src)
+            and meta.get("source_size_bytes") == str(st.st_size)
+            and meta.get("source_mtime_ns") == str(st.st_mtime_ns)
+        )
+    except Exception:
+        return False
+
+
+def _meta_dict(con: sqlite3.Connection) -> dict[str, str]:
+    return {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM meta")}
+
+
+def _ready_levels(meta: dict[str, str]) -> list[str]:
+    return [level for level in _INDEX_LEVELS if meta.get(f"ready_{level}") == "1"]
+
+
+def cache_status(vcd_path: str | Path, cache_dir: str | Path | None = None) -> dict[str, object]:
+    source = Path(vcd_path).expanduser().resolve()
+    db_path = cache_path_for(source, cache_dir)
+    source_exists = source.exists()
+    source_size = source.stat().st_size if source_exists else None
+    source_mtime_ns = source.stat().st_mtime_ns if source_exists else None
+    source_size_mb = (float(source_size) / (1024 * 1024)) if source_size is not None else None
+    status: dict[str, object] = {
+        "status": "missing",
+        "db_path": str(db_path),
+        "cache_exists": db_path.exists(),
+        "source_path": str(source),
+        "source_exists": source_exists,
+        "vcd_size_bytes": source_size,
+        "vcd_size_mb": source_size_mb,
+        "size_class": size_class_for_bytes(source_size or 0),
+        "source_mtime_ns": source_mtime_ns,
+        "cache_valid": False,
+        "build_state": "missing",
+        "ready_levels": [],
+        "query_ready": False,
+        "metadata": {},
+    }
+    if not source_exists:
+        status["status"] = "missing_source"
+        return status
+    if not db_path.exists():
+        return status
+    try:
+        con = connect(db_path, readonly=True)
+        try:
+            meta = _meta_dict(con)
+        finally:
+            con.close()
+    except Exception as exc:
+        status.update({"status": "partial", "build_state": "unreadable", "error": str(exc)})
+        return status
+    status["metadata"] = meta
+    status["build_state"] = meta.get("build_state", "unknown")
+    valid = (
+        meta.get("schema_version") == str(_SCHEMA_VERSION)
+        and meta.get("source_path") == str(source)
+        and meta.get("source_size_bytes") == str(source_size)
+        and meta.get("source_mtime_ns") == str(source_mtime_ns)
+    )
+    status["cache_valid"] = valid
+    ready = _ready_levels(meta) if valid else []
+    status["ready_levels"] = ready
+    status["query_ready"] = "changes" in ready or "runs" in ready or "edges" in ready
+    if not valid:
+        status["status"] = "stale"
+    elif meta.get("build_state", "").endswith("_building"):
+        status["status"] = "partial"
+    elif all(level in ready for level in _INDEX_LEVELS):
+        status["status"] = "ready"
+    elif ready:
+        status["status"] = "partial"
+    else:
+        status["status"] = "missing"
+    return status
+
+
+def _open_text(path: Path) -> TextIO:
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def _strip_end(line: str) -> str:
+    return line.replace("$end", "").strip()
+
+
+def _parse_timescale(line: str, fh: TextIO) -> Timescale:
+    text = line.strip()
+    while "$end" not in text:
+        nxt = fh.readline()
+        if not nxt:
+            raise ValueError("unterminated $timescale directive")
+        text += " " + nxt.strip()
+    m = _UNIT_RE.search(text)
+    if not m:
+        raise ValueError(f"unsupported or malformed timescale directive: {text}")
+    return Timescale(int(m.group(1)), m.group(2).lower())
+
+
+def _scope_path(stack: list[str]) -> str:
+    return ".".join(s for s in stack if s)
+
+
+def _leaf_from_ref(reference: str) -> str:
+    ref = reference.strip()
+    # Keep vector ranges on full paths, but leaf-name matching is cleaner without them.
+    ref = re.sub(r"\s+", " ", ref)
+    return re.sub(r"\s*\[[^\]]+\]\s*$", "", ref)
+
+
+def _parse_var(line: str, stack: list[str], signal_id: int) -> SignalDef:
+    text = line.strip()
+    while "$end" not in text:
+        raise ValueError("multi-line $var directives are not supported")
+    text = _strip_end(text)
+    parts = text.split()
+    if len(parts) < 5 or parts[0] != "$var":
+        raise ValueError(f"malformed $var directive: {line.strip()}")
+    kind = parts[1]
+    try:
+        width = int(parts[2])
+    except ValueError as exc:
+        raise ValueError(f"malformed $var width in: {line.strip()}") from exc
+    id_code = parts[3]
+    reference = " ".join(parts[4:])
+    scope = _scope_path(stack)
+    full = f"{scope}.{reference}" if scope else reference
+    leaf = _leaf_from_ref(reference)
+    return SignalDef(signal_id, id_code, full, scope, leaf, kind, width)
+
+
+def _canonical_scalar(ch: str) -> str:
+    ch = ch.lower()
+    if ch in {"0", "1", "x", "z"}:
+        return ch
+    raise ValueError(f"invalid scalar VCD value: {ch!r}")
+
+
+def _canonical_vector(kind: str, payload: str) -> str:
+    kind = kind.lower()
+    payload = payload.strip().lower()
+    if kind == "b":
+        return "b" + payload
+    if kind == "r":
+        return "r" + payload
+    if kind == "s":
+        return "s" + payload
+    raise ValueError(f"unsupported VCD vector kind: {kind!r}")
+
+
+def _value_flags(raw: str) -> tuple[int, int, str | None]:
+    lower = raw.lower()
+    has_x = 1 if "x" in lower else 0
+    has_z = 1 if "z" in lower else 0
+    int_value = None
+    try:
+        if lower in {"0", "1"}:
+            int_value = str(int(lower, 2))
+        elif lower.startswith("b") and not has_x and not has_z:
+            bits = lower[1:]
+            if bits:
+                int_value = str(int(bits, 2))
+    except ValueError:
+        int_value = None
+    return has_x, has_z, int_value
+
+
+def _classify_edge(prev: str, new: str, width: int) -> str:
+    p = prev.lower()
+    n = new.lower()
+    if width == 1 and p == "0" and n == "1":
+        return "rise"
+    if width == 1 and p == "1" and n == "0":
+        return "fall"
+    p_has_x, p_has_z, _ = _value_flags(p)
+    n_has_x, n_has_z, _ = _value_flags(n)
+    if not p_has_x and n_has_x:
+        return "x_enter"
+    if p_has_x and not n_has_x:
+        return "x_exit"
+    if not p_has_z and n_has_z:
+        return "z_enter"
+    if p_has_z and not n_has_z:
+        return "z_exit"
+    if width == 1:
+        return "scalar_change"
+    return "vector_change"
+
+
+def _create_schema(con: sqlite3.Connection) -> None:
+    con.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA temp_store=MEMORY;
+
+        CREATE TABLE meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE signals (
+            signal_id INTEGER PRIMARY KEY,
+            id_code TEXT NOT NULL,
+            full_path TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            leaf TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            full_path_lc TEXT NOT NULL,
+            scope_lc TEXT NOT NULL,
+            leaf_lc TEXT NOT NULL
+        );
+
+        CREATE TABLE values_interned (
+            value_id INTEGER PRIMARY KEY,
+            raw_value TEXT NOT NULL UNIQUE,
+            has_x INTEGER NOT NULL,
+            has_z INTEGER NOT NULL,
+            int_value TEXT
+        );
+
+        CREATE TABLE changes (
+            signal_id INTEGER NOT NULL,
+            tick INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            value_id INTEGER NOT NULL,
+            PRIMARY KEY(signal_id, tick, ordinal)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE signal_runs (
+            signal_id INTEGER NOT NULL,
+            start_tick INTEGER NOT NULL,
+            end_tick INTEGER NOT NULL,
+            value_id INTEGER NOT NULL,
+            PRIMARY KEY(signal_id, start_tick)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE signal_edges (
+            signal_id INTEGER NOT NULL,
+            tick INTEGER NOT NULL,
+            from_value_id INTEGER NOT NULL,
+            to_value_id INTEGER NOT NULL,
+            edge_kind TEXT NOT NULL,
+            PRIMARY KEY(signal_id, tick, to_value_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE clock_edges (
+            clock_signal_id INTEGER NOT NULL,
+            edge_kind TEXT NOT NULL,
+            cycle_index INTEGER NOT NULL,
+            tick INTEGER NOT NULL,
+            PRIMARY KEY(clock_signal_id, edge_kind, cycle_index)
+        ) WITHOUT ROWID;
+        """
+    )
+
+
+def _create_indexes(con: sqlite3.Connection, level: str) -> None:
+    con.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_signals_full_lc ON signals(full_path_lc);
+        CREATE INDEX IF NOT EXISTS idx_signals_leaf_lc ON signals(leaf_lc);
+        CREATE INDEX IF NOT EXISTS idx_signals_scope_lc ON signals(scope_lc);
+        """
+    )
+    if level in {"changes", "runs", "edges", "full"}:
+        con.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_changes_sig_tick_value ON changes(signal_id, tick, value_id);
+            CREATE INDEX IF NOT EXISTS idx_changes_tick_sig_value ON changes(tick, signal_id, value_id);
+            """
+        )
+    if level in {"runs", "full"}:
+        con.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runs_value_at ON signal_runs(signal_id, start_tick DESC, end_tick, value_id);
+            CREATE INDEX IF NOT EXISTS idx_runs_window ON signal_runs(signal_id, start_tick, end_tick, value_id);
+            """
+        )
+    if level in {"edges", "full"}:
+        con.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_edges_sig_kind_tick ON signal_edges(signal_id, edge_kind, tick);
+            CREATE INDEX IF NOT EXISTS idx_edges_tick_sig_kind ON signal_edges(tick, signal_id, edge_kind);
+            CREATE INDEX IF NOT EXISTS idx_clock_tick ON clock_edges(clock_signal_id, edge_kind, tick, cycle_index);
+            """
+        )
+
+
+def _insert_meta(con: sqlite3.Connection, rows: dict[str, str]) -> None:
+    con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", rows.items())
+
+
+def _replace_cache(tmp_path: Path, db_path: Path) -> None:
+    # Windows refuses to replace a SQLite DB while stale WAL sidecars exist.
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(tmp_path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    if db_path.exists():
+        db_path.unlink()
+    os.replace(tmp_path, db_path)
+
+
+def _insert_signals(con: sqlite3.Connection, signals: Iterable[SignalDef]) -> None:
+    con.executemany(
+        """
+        INSERT INTO signals(signal_id, id_code, full_path, scope, leaf, kind, width,
+                            full_path_lc, scope_lc, leaf_lc)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                s.signal_id,
+                s.id_code,
+                s.full_path,
+                s.scope,
+                s.leaf,
+                s.kind,
+                s.width,
+                s.full_path.lower(),
+                s.scope.lower(),
+                s.leaf.lower(),
+            )
+            for s in signals
+        ),
+    )
+
+
+def _base_meta(source: Path, source_stat: os.stat_result, timescale: Timescale | None, signal_count: int) -> dict[str, str]:
+    meta = {
+        "schema_version": str(_SCHEMA_VERSION),
+        "source_path": str(source),
+        "vcd_path": str(source),
+        "source_size_bytes": str(source_stat.st_size),
+        "vcd_size": str(source_stat.st_size),
+        "source_mtime_ns": str(source_stat.st_mtime_ns),
+        "vcd_mtime": str(source_stat.st_mtime_ns),
+        "waveq_version": "2",
+        "signal_count": str(signal_count),
+        "change_count": "0",
+        "run_count": "0",
+        "edge_count": "0",
+        "min_tick": "0",
+        "max_tick": "0",
+        "ready_metadata": "1" if timescale is not None else "0",
+        "ready_changes": "0",
+        "ready_runs": "0",
+        "ready_edges": "0",
+    }
+    if timescale is not None:
+        meta["timescale_number"] = str(timescale.number)
+        meta["timescale_unit"] = timescale.unit
+    return meta
+
+
+def _parse_header(source: Path) -> tuple[Timescale, list[SignalDef]]:
+    signal_defs: list[SignalDef] = []
+    timescale: Timescale | None = None
+    scope_stack: list[str] = []
+    next_signal_id = 1
+    with _open_text(source) as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("$timescale"):
+                timescale = _parse_timescale(line, fh)
+                continue
+            if line.startswith("$scope"):
+                text = _strip_end(line)
+                parts = text.split(maxsplit=2)
+                if len(parts) >= 3:
+                    scope_stack.append(parts[2])
+                continue
+            if line.startswith("$upscope"):
+                if scope_stack:
+                    scope_stack.pop()
+                continue
+            if line.startswith("$var"):
+                sig = _parse_var(line, scope_stack, next_signal_id)
+                next_signal_id += 1
+                signal_defs.append(sig)
+                continue
+            if line.startswith("$enddefinitions"):
+                break
+    if timescale is None:
+        raise ValueError("VCD has no $timescale")
+    return timescale, signal_defs
+
+
+def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *, rebuild: bool = False) -> BuildStats:
+    source = Path(vcd_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    if not (source.name.endswith(".vcd") or source.name.endswith(".vcd.gz")):
+        raise ValueError("WaveQ expects a .vcd or .vcd.gz input")
+
+    db_path = cache_path_for(source, cache_dir)
+    status = cache_status(source, cache_dir)
+    if not rebuild and status.get("cache_valid") and "metadata" in status.get("ready_levels", []):
+        meta = status.get("metadata", {})
+        return BuildStats(
+            db_path=db_path,
+            signal_count=int(meta.get("signal_count", 0)),
+            change_count=int(meta.get("change_count", 0)),
+            run_count=int(meta.get("run_count", 0)),
+            edge_count=int(meta.get("edge_count", 0)),
+            min_tick=int(meta.get("min_tick", 0)),
+            max_tick=int(meta.get("max_tick", 0)),
+            build_seconds=0.0,
+            source_size_bytes=source.stat().st_size,
+            size_class=size_class_for_bytes(source.stat().st_size),
+            built_level="metadata",
+            reused=True,
+        )
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    start = time.perf_counter()
+    con = sqlite3.connect(tmp_path)
+    con.row_factory = sqlite3.Row
+    _create_schema(con)
+    source_stat = source.stat()
+    _insert_meta(con, {
+        "schema_version": str(_SCHEMA_VERSION),
+        "source_path": str(source),
+        "source_size_bytes": str(source_stat.st_size),
+        "source_mtime_ns": str(source_stat.st_mtime_ns),
+        "build_state": "metadata_building",
+        "ready_metadata": "0",
+        "ready_changes": "0",
+        "ready_runs": "0",
+        "ready_edges": "0",
+    })
+    timescale, signal_defs = _parse_header(source)
+    _insert_signals(con, signal_defs)
+    meta = _base_meta(source, source_stat, timescale, len(signal_defs))
+    meta["build_state"] = "metadata_ready"
+    _insert_meta(con, meta)
+    _create_indexes(con, "metadata")
+    con.execute("ANALYZE")
+    con.execute("PRAGMA optimize")
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
+    _replace_cache(tmp_path, db_path)
+    return BuildStats(
+        db_path=db_path,
+        signal_count=len(signal_defs),
+        change_count=0,
+        run_count=0,
+        edge_count=0,
+        min_tick=0,
+        max_tick=0,
+        build_seconds=time.perf_counter() - start,
+        source_size_bytes=source_stat.st_size,
+        size_class=size_class_for_bytes(source_stat.st_size),
+        built_level="metadata",
+        reused=False,
+    )
+
+
+def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *, rebuild: bool = False, level: str = "full") -> BuildStats:
+    if level not in {"changes", "runs", "edges", "full"}:
+        raise ValueError("index level must be one of: changes, runs, edges, full")
+    build_runs = level in {"runs", "full"}
+    build_edges = level in {"edges", "full"}
+    source = Path(vcd_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    if not (source.name.endswith(".vcd") or source.name.endswith(".vcd.gz")):
+        raise ValueError("WaveQ expects a .vcd or .vcd.gz input")
+
+    db_path = cache_path_for(source, cache_dir)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    requested_ready = ["metadata", "changes"]
+    if level in {"runs", "full"}:
+        requested_ready.append("runs")
+    if level in {"edges", "full"}:
+        requested_ready.append("edges")
+    status = cache_status(source, cache_dir)
+    if not rebuild and status.get("cache_valid") and all(x in status.get("ready_levels", []) for x in requested_ready):
+        meta = status.get("metadata", {})
+        return BuildStats(
+            db_path=db_path,
+            signal_count=int(meta.get("signal_count", 0)),
+            change_count=int(meta.get("change_count", 0)),
+            run_count=int(meta.get("run_count", 0)),
+            edge_count=int(meta.get("edge_count", 0)),
+            min_tick=int(meta.get("min_tick", 0)),
+            max_tick=int(meta.get("max_tick", 0)),
+            build_seconds=0.0,
+            source_size_bytes=source.stat().st_size,
+            size_class=size_class_for_bytes(source.stat().st_size),
+            built_level=level,
+            reused=True,
+        )
+
+    tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    start = time.perf_counter()
+    con = sqlite3.connect(tmp_path)
+    con.row_factory = sqlite3.Row
+    _create_schema(con)
+
+    source_stat = source.stat()
+    _insert_meta(con, {
+        "schema_version": str(_SCHEMA_VERSION),
+        "source_path": str(source),
+        "source_size_bytes": str(source_stat.st_size),
+        "source_mtime_ns": str(source_stat.st_mtime_ns),
+        "build_state": f"{level}_building",
+        "ready_metadata": "0",
+        "ready_changes": "0",
+        "ready_runs": "0",
+        "ready_edges": "0",
+    })
+    signal_defs: list[SignalDef] = []
+    id_to_signals: dict[str, list[SignalDef]] = {}
+    timescale: Timescale | None = None
+    scope_stack: list[str] = []
+    next_signal_id = 1
+    current_tick = 0
+    min_tick: int | None = None
+    max_tick = 0
+    ordinal = 0
+    change_count = 0
+    run_count = 0
+    edge_count = 0
+    value_ids: dict[str, int] = {}
+    current_value: dict[int, str] = {}
+    current_run_start: dict[int, int] = {}
+    pending_final_by_id: dict[str, str] = {}
+    signal_by_id: dict[int, SignalDef] = {}
+    in_header = True
+    in_dumpvars = False
+    signal_rows_inserted = False
+    changes_batch: list[tuple[int, int, int, int]] = []
+    runs_batch: list[tuple[int, int, int, int]] = []
+    edges_batch: list[tuple[int, int, int, int, str]] = []
+    VALUE_BATCH = 10000
+
+    def value_id(raw: str) -> int:
+        cached = value_ids.get(raw)
+        if cached is not None:
+            return cached
+        has_x, has_z, int_value = _value_flags(raw)
+        cur = con.execute(
+            "INSERT OR IGNORE INTO values_interned(raw_value, has_x, has_z, int_value) VALUES(?, ?, ?, ?)",
+            (raw, has_x, has_z, int_value),
+        )
+        if cur.lastrowid:
+            vid = int(cur.lastrowid)
+        else:
+            vid = int(con.execute("SELECT value_id FROM values_interned WHERE raw_value=?", (raw,)).fetchone()[0])
+        value_ids[raw] = vid
+        return vid
+
+    x_value_id = value_id("x")
+
+    def flush_batches(force: bool = False) -> None:
+        nonlocal changes_batch, runs_batch, edges_batch
+        if changes_batch and (force or len(changes_batch) >= VALUE_BATCH):
+            con.executemany("INSERT INTO changes(signal_id, tick, ordinal, value_id) VALUES(?, ?, ?, ?)", changes_batch)
+            changes_batch = []
+        if runs_batch and (force or len(runs_batch) >= VALUE_BATCH):
+            con.executemany("INSERT INTO signal_runs(signal_id, start_tick, end_tick, value_id) VALUES(?, ?, ?, ?)", runs_batch)
+            runs_batch = []
+        if edges_batch and (force or len(edges_batch) >= VALUE_BATCH):
+            con.executemany(
+                "INSERT INTO signal_edges(signal_id, tick, from_value_id, to_value_id, edge_kind) VALUES(?, ?, ?, ?, ?)",
+                edges_batch,
+            )
+            edges_batch = []
+
+    def insert_signal_rows_once() -> None:
+        nonlocal signal_rows_inserted
+        if signal_rows_inserted:
+            return
+        if timescale is None:
+            raise ValueError("VCD has no $timescale before changes")
+        _insert_signals(con, signal_defs)
+        for s in signal_defs:
+            signal_by_id[s.signal_id] = s
+            current_value[s.signal_id] = "x"
+            current_run_start[s.signal_id] = 0
+        signal_rows_inserted = True
+
+    def flush_pending(final_tick: int) -> None:
+        nonlocal run_count, edge_count, pending_final_by_id
+        if not pending_final_by_id:
+            return
+        insert_signal_rows_once()
+        for id_code, raw in list(pending_final_by_id.items()):
+            for sig in id_to_signals.get(id_code, []):
+                prev = current_value.get(sig.signal_id, "x")
+                if raw == prev:
+                    continue
+                start_tick = current_run_start[sig.signal_id]
+                if build_runs and final_tick > start_tick:
+                    runs_batch.append((sig.signal_id, start_tick, final_tick, value_id(prev)))
+                    run_count += 1
+                if build_edges:
+                    edges_batch.append((sig.signal_id, final_tick, value_id(prev), value_id(raw), _classify_edge(prev, raw, sig.width)))
+                    edge_count += 1
+                current_value[sig.signal_id] = raw
+                current_run_start[sig.signal_id] = final_tick
+        pending_final_by_id = {}
+        flush_batches()
+
+    def record_change(raw: str, id_code: str) -> None:
+        nonlocal change_count, ordinal, min_tick, max_tick
+        insert_signal_rows_once()
+        if id_code not in id_to_signals:
+            # Some VCDs contain comments or unsupported constructs in dump sections.
+            return
+        if min_tick is None:
+            min_tick = current_tick
+        max_tick = max(max_tick, current_tick)
+        vid = value_id(raw)
+        for sig in id_to_signals[id_code]:
+            ordinal += 1
+            changes_batch.append((sig.signal_id, current_tick, ordinal, vid))
+            change_count += 1
+        pending_final_by_id[id_code] = raw
+        flush_batches()
+
+    with _open_text(source) as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if in_header:
+                if line.startswith("$timescale"):
+                    timescale = _parse_timescale(line, fh)
+                    continue
+                if line.startswith("$scope"):
+                    text = _strip_end(line)
+                    parts = text.split(maxsplit=2)
+                    if len(parts) >= 3:
+                        scope_stack.append(parts[2])
+                    continue
+                if line.startswith("$upscope"):
+                    if scope_stack:
+                        scope_stack.pop()
+                    continue
+                if line.startswith("$var"):
+                    sig = _parse_var(line, scope_stack, next_signal_id)
+                    next_signal_id += 1
+                    signal_defs.append(sig)
+                    id_to_signals.setdefault(sig.id_code, []).append(sig)
+                    continue
+                if line.startswith("$enddefinitions"):
+                    in_header = False
+                    insert_signal_rows_once()
+                    continue
+                continue
+
+            if line.startswith("$dumpvars"):
+                in_dumpvars = True
+                continue
+            if line.startswith("$end") and in_dumpvars:
+                in_dumpvars = False
+                continue
+            if line.startswith("#"):
+                flush_pending(current_tick)
+                try:
+                    current_tick = int(line[1:].strip())
+                except ValueError as exc:
+                    raise ValueError(f"malformed VCD timestamp: {line!r}") from exc
+                max_tick = max(max_tick, current_tick)
+                continue
+            first = line[0]
+            if first in "01xXzZ":
+                record_change(_canonical_scalar(first), line[1:].strip())
+                continue
+            if first in "bBrRsS":
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                record_change(_canonical_vector(first, parts[0][1:]), parts[1].strip())
+                continue
+            # Ignore comments and unsupported dump directives, not unknown data.
+
+    if timescale is None:
+        raise ValueError("VCD has no $timescale")
+    flush_pending(current_tick)
+    end_tick = max_tick + 1
+    if build_runs:
+        for sig in signal_defs:
+            start_tick = current_run_start.get(sig.signal_id, 0)
+            raw = current_value.get(sig.signal_id, "x")
+            if end_tick > start_tick:
+                runs_batch.append((sig.signal_id, start_tick, end_tick, value_id(raw)))
+                run_count += 1
+    flush_batches(force=True)
+
+    meta = _base_meta(source, source_stat, timescale, len(signal_defs))
+    meta.update({
+        "build_state": "ready" if level == "full" else f"{level}_ready",
+        "ready_changes": "1",
+        "ready_runs": "1" if build_runs else "0",
+        "ready_edges": "1" if build_edges else "0",
+        "change_count": str(change_count),
+        "run_count": str(run_count),
+        "edge_count": str(edge_count),
+        "min_tick": str(min_tick if min_tick is not None else 0),
+        "max_tick": str(max_tick),
+    })
+    _insert_meta(con, meta)
+    _create_indexes(con, level)
+    con.execute("ANALYZE")
+    con.execute("PRAGMA optimize")
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
+    _replace_cache(tmp_path, db_path)
+    elapsed = time.perf_counter() - start
+    return BuildStats(
+        db_path=db_path,
+        signal_count=len(signal_defs),
+        change_count=change_count,
+        run_count=run_count,
+        edge_count=edge_count,
+        min_tick=min_tick if min_tick is not None else 0,
+        max_tick=max_tick,
+        build_seconds=elapsed,
+        source_size_bytes=source_stat.st_size,
+        size_class=size_class_for_bytes(source_stat.st_size),
+        built_level=level,
+        reused=False,
+    )

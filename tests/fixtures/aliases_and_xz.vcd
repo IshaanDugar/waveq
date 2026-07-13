@@ -1,0 +1,19 @@
+$timescale 1 ns $end
+$scope module tb $end
+$var wire 1 ! a $end
+$var wire 1 ! alias_a $end
+$var wire 1 " b $end
+$upscope $end
+$enddefinitions $end
+$dumpvars
+x!
+z"
+$end
+#1
+1!
+#2
+0!
+#3
+x"
+#4
+1"

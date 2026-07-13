@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# WaveQ runtime caches
+.waveq_cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local test and benchmark output (regenerate with benchmarks/benchmark_waveq.py)
+.tmp/
+reports/
+
+# Editor and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

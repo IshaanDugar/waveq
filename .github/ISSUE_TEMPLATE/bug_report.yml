@@ -1,0 +1,37 @@
+name: Bug report
+description: Report incorrect behavior, crashes, or unexpected query results
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect vs. what actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: VCD path (or fixture), tool/CLI command, and inputs
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: WaveQ version
+      placeholder: "3.0.0"
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows
+        - Linux
+        - macOS
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.11.9"

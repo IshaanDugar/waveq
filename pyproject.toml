@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "waveq"
+version = "3.0.0"
+description = "Give your AI assistant eyes on VCD waveforms — a local MCP server with zero dependencies and exact signal answers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "Ishaan Dugar"}]
+keywords = ["vcd", "waveform", "sqlite", "mcp", "eda", "design-verification", "rtl", "simulation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/IshaanDugar/waveq"
+Repository = "https://github.com/IshaanDugar/waveq"
+Issues = "https://github.com/IshaanDugar/waveq/issues"
+
+[project.scripts]
+waveq = "waveq.cli:main"
+waveq-mcp = "waveq.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["waveq*"]
