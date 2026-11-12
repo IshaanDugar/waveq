@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from typing import Any
 
 from . import __version__
-from .engine import WaveQEngine
+from .db import EDGE_KINDS
+from .engine import FIND_SAMPLES, WaveQEngine
 
 
 def print_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=False))
+
+
+_COND_RE = re.compile(r"^(.+?)\s*(==|!=)\s*(\S+)$")
+
+
+def parse_condition(text: str) -> dict[str, str]:
+    m = _COND_RE.match(text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"condition must look like SIGNAL==VALUE or SIGNAL!=VALUE: {text!r}")
+    return {"signal": m.group(1), "op": m.group(2), "value": m.group(3)}
 
 
 def configured_engine(args: argparse.Namespace) -> tuple[WaveQEngine, dict[str, Any]]:
@@ -36,8 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("value", help="Read one signal value at a time"); add_common(sp); sp.add_argument("signal"); sp.add_argument("time")
     sp = sub.add_parser("values", help="Read multiple signal values at a time"); add_common(sp); sp.add_argument("time"); sp.add_argument("signals", nargs="+")
     sp = sub.add_parser("changes", help="List changes for a signal in a time window"); add_common(sp); sp.add_argument("signal"); sp.add_argument("start"); sp.add_argument("end"); sp.add_argument("--limit", type=int, default=200)
-    sp = sub.add_parser("edges", help="List precomputed edges"); add_common(sp); sp.add_argument("signal"); sp.add_argument("--kind"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=200)
+    sp = sub.add_parser("edges", help="List precomputed edges"); add_common(sp); sp.add_argument("signal"); sp.add_argument("--kind", choices=EDGE_KINDS); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=200)
     sp = sub.add_parser("digest", help="Summarize a window around a time"); add_common(sp); sp.add_argument("center_time"); sp.add_argument("radius"); sp.add_argument("--signals", nargs="*"); sp.add_argument("--scope"); sp.add_argument("--max-signals", type=int, default=30)
+    sp = sub.add_parser("find", help="Find when conditions hold (ANDed), as intervals or clock cycles"); add_common(sp); sp.add_argument("conditions", nargs="+", type=parse_condition, metavar="SIGNAL==VALUE"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--clock", help="Match per clock edge instead of returning intervals"); sp.add_argument("--edge", choices=["rise", "fall"], default="rise"); sp.add_argument("--sample", choices=FIND_SAMPLES, default="before"); sp.add_argument("--limit", type=int, default=100)
     sub.add_parser("mcp", help="Run the MCP stdio server")
 
     args = p.parse_args(argv)
@@ -72,6 +85,14 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "changes": result = eng.changes(args.signal, args.start, args.end, args.limit)
     elif args.cmd == "edges": result = eng.edges(args.signal, args.kind, args.start, args.end, args.limit)
     elif args.cmd == "digest": result = eng.window_digest(args.center_time, args.radius, args.signals, args.scope, args.max_signals)
+    elif args.cmd == "find":
+        result = None
+        if args.clock:
+            clk = eng.define_clock(args.clock, args.edge)
+            if not clk.get("ok"):
+                result = clk
+        if result is None:
+            result = eng.find_times(args.conditions, args.start, args.end, args.clock, args.edge, args.sample, args.limit)
     else: raise AssertionError(args.cmd)
     print_json(result)
     return 0 if result.get("ok") else 1

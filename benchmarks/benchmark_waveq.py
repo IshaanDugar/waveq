@@ -112,6 +112,9 @@ def run_case(work: Path, name: str, *, signals: int, ticks: int, stride: int, pa
     assert eng.window_digest(f"{ticks // 2}ns", "20ns", max_signals=20)["ok"] is True
     eng.define_clock("tb.clk", "rise")
     assert eng.time_to_cycle("tb.clk", f"{ticks // 2}ns")["ok"] is True
+    find_conds = [{"signal": "tb.sig_0001", "value": "1"}, {"signal": "tb.sig_0002", "value": "1"}]
+    assert eng.find_times(find_conds, limit=10000)["ok"] is True
+    assert eng.find_times(find_conds, clock="tb.clk", limit=10000)["ok"] is True
 
     timings = {
         "index_status_median_ms": median_ms(lambda: eng.index_status(str(vcd), str(cache)), 30),
@@ -119,6 +122,8 @@ def run_case(work: Path, name: str, *, signals: int, ticks: int, stride: int, pa
         "values_at_8_median_ms": median_ms(lambda: eng.values_at(["tb.clk", "tb.sig_0001", "tb.sig_0002", "tb.sig_0003", "tb.sig_0004", "tb.sig_0005", "tb.sig_0006", "tb.sig_0007"], f"{ticks // 2}ns"), 100),
         "changes_many_8_median_ms": median_ms(lambda: eng.changes_many(["tb.clk", "tb.sig_0001", "tb.sig_0002", "tb.sig_0003", "tb.sig_0004", "tb.sig_0005", "tb.sig_0006", "tb.sig_0007"], f"{ticks // 2 - 50}ns", f"{ticks // 2 + 50}ns", 200), 50),
         "window_digest_median_ms": median_ms(lambda: eng.window_digest(f"{ticks // 2}ns", "50ns", max_signals=30), 30),
+        "find_times_intervals_median_ms": median_ms(lambda: eng.find_times(find_conds, limit=10000), 30),
+        "find_times_clock_median_ms": median_ms(lambda: eng.find_times(find_conds, clock="tb.clk", limit=10000), 30),
         "edges_clk_median_ms": median_ms(lambda: eng.edges("tb.clk", kind="rise", start="0ns", end=f"{ticks}ns", limit=10000), 30),
     }
     db_path = Path(build_full["data"]["db_path"])
@@ -154,8 +159,8 @@ def write_reports(results: list[dict[str, object]], output: Path) -> None:
         "",
         "Synthetic deterministic VCDs were generated locally. Each case measures metadata configure, index status, explicit index builds, cache reuse, and strict query checks.",
         "",
-        "| Case | Size class | Signals | Ticks | VCD size | DB size | Configure s | Query ready after configure | Reuse s | Changes build s | Runs build s | Full build s | Changes | Runs | Edges | status ms | value_at ms | values_at(8) ms | changes_many(8) ms | digest ms | clk edges ms |",
-        "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Case | Size class | Signals | Ticks | VCD size | DB size | Configure s | Query ready after configure | Reuse s | Changes build s | Runs build s | Full build s | Changes | Runs | Edges | status ms | value_at ms | values_at(8) ms | changes_many(8) ms | digest ms | clk edges ms | find intervals ms | find clock ms |",
+        "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in results:
         lines.append(
@@ -164,7 +169,8 @@ def write_reports(results: list[dict[str, object]], output: Path) -> None:
             f"{float(r['build_changes_seconds']):.4f} | {float(r['build_runs_seconds']):.4f} | {float(r['build_full_seconds']):.4f} | "
             f"{r['change_count']} | {r['run_count']} | {r['edge_count']} | {float(r['index_status_median_ms']):.4f} | "
             f"{float(r['value_at_median_ms']):.4f} | {float(r['values_at_8_median_ms']):.4f} | {float(r['changes_many_8_median_ms']):.4f} | "
-            f"{float(r['window_digest_median_ms']):.4f} | {float(r['edges_clk_median_ms']):.4f} |"
+            f"{float(r['window_digest_median_ms']):.4f} | {float(r['edges_clk_median_ms']):.4f} | "
+            f"{float(r['find_times_intervals_median_ms']):.4f} | {float(r['find_times_clock_median_ms']):.4f} |"
         )
     lines.extend([
         "",
