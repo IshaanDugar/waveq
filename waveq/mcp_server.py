@@ -7,11 +7,13 @@ import traceback
 from typing import Any, Callable
 
 from . import __version__
-from .engine import WaveQEngine, fail
+from .db import CLOCK_EDGE_KINDS, EDGE_KINDS
+from .engine import FIND_OPS, FIND_SAMPLES, WaveQEngine, fail
 
 SERVER_INSTRUCTIONS = (
     "Use WaveQ to inspect VCD waveforms. First call configure_waveform. Large VCDs configure metadata only; call index_status and build_index before indexed queries. "
     "Resolve ambiguous names with resolve_signals. Prefer batch tools values_at, changes_many, and window_digest over repeated single-signal calls. "
+    "Use find_times to answer when/whether a condition occurred (e.g. valid==1 and ready==1 at clk rising edges) instead of scanning changes. "
     "Use define_clock before cycle-based queries. WaveQ reports observed waveform facts; it does not prove protocol correctness unless a tool explicitly checks a rule."
 )
 
@@ -24,6 +26,10 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
 
 def _str(desc: str) -> dict[str, Any]:
     return {"type": "string", "description": desc}
+
+
+def _enum(desc: str, values: tuple[str, ...]) -> dict[str, Any]:
+    return {"type": "string", "enum": list(values), "description": desc}
 
 
 def _int(desc: str, default: int | None = None) -> dict[str, Any]:
@@ -60,7 +66,7 @@ TOOLS: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str,
         _schema({
             "vcd_path": _str("Optional path to .vcd or .vcd.gz"),
             "cache_dir": _str("Optional cache directory"),
-            "level": _str("changes, runs, edges, or full"),
+            "level": _enum("Index level; default full", ("changes", "runs", "edges", "full")),
             "signals": _arr("Optional signal subset; currently unsupported"),
             "rebuild": _bool("Force rebuild", False),
         }),
@@ -94,12 +100,12 @@ TOOLS: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str,
     ),
     "edges": (
         "Return precomputed signal edges. Kinds include rise, fall, x_enter, x_exit, z_enter, z_exit, scalar_change, vector_change.",
-        _schema({"signal": _str("Signal full path or unique leaf"), "kind": _str("Optional edge kind"), "start": _str("Optional start"), "end": _str("Optional end"), "limit": _int("Max rows", 200)}, ["signal"]),
+        _schema({"signal": _str("Signal full path or unique leaf"), "kind": _enum("Optional edge kind", EDGE_KINDS), "start": _str("Optional start"), "end": _str("Optional end"), "limit": _int("Max rows", 200)}, ["signal"]),
         lambda a: ENGINE.edges(a["signal"], a.get("kind"), a.get("start"), a.get("end"), int(a.get("limit", 200))),
     ),
     "first_edge_after": (
         "Return the first edge of a given kind after a time.",
-        _schema({"signal": _str("Signal full path or unique leaf"), "kind": _str("Edge kind"), "time": _str("Reference time")}, ["signal", "kind", "time"]),
+        _schema({"signal": _str("Signal full path or unique leaf"), "kind": _enum("Edge kind", EDGE_KINDS), "time": _str("Reference time")}, ["signal", "kind", "time"]),
         lambda a: ENGINE.first_edge_after(a["signal"], a["kind"], a["time"]),
     ),
     "stable_between": (
@@ -112,29 +118,53 @@ TOOLS: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str,
         _schema({"center_time": _str("Center time"), "radius": _str("Half-window radius"), "signals": _arr("Optional selected signals"), "scope": _str("Optional scope filter"), "max_signals": _int("Maximum signals", 30)}, ["center_time", "radius"]),
         lambda a: ENGINE.window_digest(a["center_time"], a["radius"], a.get("signals"), a.get("scope"), int(a.get("max_signals", 30))),
     ),
+    "find_times": (
+        "Find when all conditions hold (ANDed). Without clock: returns time intervals. With clock (call define_clock first): returns the "
+        "cycles whose edge satisfies the conditions, sampled just before the edge by default (flip-flop semantics). "
+        "No match is ok with status no_match. Use limit=1 for 'first time X happened'.",
+        _schema({
+            "conditions": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Conditions that must all hold",
+                "items": _schema({
+                    "signal": _str("Signal full path or unique leaf"),
+                    "op": _enum("Comparison; default ==", FIND_OPS),
+                    "value": _str("x, z, decimal, 0x-hex, or 0b-binary. Numeric matches never include x/z values"),
+                }, ["signal", "value"]),
+            },
+            "start": _str("Optional window start"),
+            "end": _str("Optional window end"),
+            "clock": _str("Optional clock signal; switches to per-cycle matching"),
+            "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS),
+            "sample": _enum("Sample just before the edge (default) or at the edge tick", FIND_SAMPLES),
+            "limit": _int("Max matches", 100),
+        }, ["conditions"]),
+        lambda a: ENGINE.find_times(list(a["conditions"]), a.get("start"), a.get("end"), a.get("clock"), a.get("edge", "rise"), a.get("sample", "before"), int(a.get("limit", 100))),
+    ),
     "define_clock": (
         "Build a cycle index from one signal's edge events. Call before cycle-based tools.",
-        _schema({"signal": _str("Clock signal"), "edge": _str("rise or fall; default rise")}, ["signal"]),
+        _schema({"signal": _str("Clock signal"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["signal"]),
         lambda a: ENGINE.define_clock(a["signal"], a.get("edge", "rise")),
     ),
     "time_to_cycle": (
         "Map a time to the latest clock cycle at or before that time.",
-        _schema({"clock": _str("Clock signal"), "time": _str("Query time"), "edge": _str("rise or fall; default rise")}, ["clock", "time"]),
+        _schema({"clock": _str("Clock signal"), "time": _str("Query time"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["clock", "time"]),
         lambda a: ENGINE.time_to_cycle(a["clock"], a["time"], a.get("edge", "rise")),
     ),
     "cycle_to_time": (
         "Map a clock cycle index to its VCD time.",
-        _schema({"clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _str("rise or fall; default rise")}, ["clock", "cycle_index"]),
+        _schema({"clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["clock", "cycle_index"]),
         lambda a: ENGINE.cycle_to_time(a["clock"], int(a["cycle_index"]), a.get("edge", "rise")),
     ),
     "values_at_cycle": (
         "Batch values_at for several signals at a clock cycle.",
-        _schema({"signals": _arr("Signal full paths or unique leaf names"), "clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _str("rise or fall; default rise")}, ["signals", "clock", "cycle_index"]),
+        _schema({"signals": _arr("Signal full paths or unique leaf names"), "clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["signals", "clock", "cycle_index"]),
         lambda a: ENGINE.values_at_cycle(list(a["signals"]), a["clock"], int(a["cycle_index"]), a.get("edge", "rise")),
     ),
     "changes_by_cycle": (
         "Return one signal's changes between two clock cycle indices.",
-        _schema({"signal": _str("Signal full path or unique leaf"), "clock": _str("Clock signal"), "start_cycle": _int("Start cycle"), "end_cycle": _int("End cycle"), "edge": _str("rise or fall; default rise"), "limit": _int("Max rows", 200)}, ["signal", "clock", "start_cycle", "end_cycle"]),
+        _schema({"signal": _str("Signal full path or unique leaf"), "clock": _str("Clock signal"), "start_cycle": _int("Start cycle"), "end_cycle": _int("End cycle"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS), "limit": _int("Max rows", 200)}, ["signal", "clock", "start_cycle", "end_cycle"]),
         lambda a: ENGINE.changes_by_cycle(a["signal"], a["clock"], int(a["start_cycle"]), int(a["end_cycle"]), a.get("edge", "rise"), int(a.get("limit", 200))),
     ),
 }

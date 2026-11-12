@@ -56,7 +56,7 @@ On Windows, use backslashes escaped in JSON:
 }
 ```
 
-Restart Cursor (or reload MCP servers). WaveQ should appear as `waveq` with 18 tools.
+Restart Cursor (or reload MCP servers). WaveQ should appear as `waveq` with 19 tools.
 
 **Tip:** Add [AGENTS.md](../../AGENTS.md) or its contents to your project rules so the agent follows the recommended WaveQ workflow.
 

@@ -47,7 +47,7 @@ approval_mode = "approve"
 approval_mode = "approve"
 ```
 
-Repeat for other tools as needed. See the [README tool table](../../README.md#mcp-tools-18) for the full list.
+Repeat for other tools as needed. See the [README tool table](../../README.md#mcp-tools-19) for the full list.
 
 ## 3. Verify in Codex
 
