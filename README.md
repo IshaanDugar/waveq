@@ -70,6 +70,7 @@ See [AGENTS.md](AGENTS.md) for the recommended tool workflow.
 - Resolve fuzzy signal names to exact hierarchical paths
 - Query values at a time, changes in a window, edges, and stability
 - Summarize a debug window with `window_digest` instead of raw dumps
+- Find when conditions held with `find_times` — e.g. every cycle where `valid==1 && ready==1` at a rising clock edge
 - Build a clock cycle index and query by cycle
 - Return `ok: false` on missing signals, bad times, or partial batch failures — no silent success
 
@@ -90,9 +91,9 @@ WaveQ is size-aware. Small VCDs may auto-index on configure; larger files stay m
 
 Recommended agent workflow:
 
-1. `configure_waveform` → 2. `index_status` → 3. `build_index` if needed → 4. `resolve_signals` → 5. `define_clock` (for cycles) → 6. `window_digest` near the failure → 7. follow up with `values_at`, `changes_many`, `edges`
+1. `configure_waveform` → 2. `index_status` → 3. `build_index` if needed → 4. `resolve_signals` → 5. `define_clock` (for cycles) → 6. `window_digest` near the failure → 7. follow up with `values_at`, `changes_many`, `edges`, or `find_times` for "when did X happen?"
 
-### MCP tools (18)
+### MCP tools (19)
 
 | Tool | Purpose |
 |------|---------|
@@ -106,6 +107,7 @@ Recommended agent workflow:
 | `edges` / `first_edge_after` | Precomputed edge facts |
 | `stable_between` | Held-value check over a range |
 | `window_digest` | Compact "what changed here?" summary |
+| `find_times` | When/whether conditions held: time intervals, or clock cycles (sampled before the edge) |
 | `define_clock` | Build cycle index from clock edges |
 | `time_to_cycle` / `cycle_to_time` | Time ↔ cycle conversion |
 | `values_at_cycle` / `changes_by_cycle` | Cycle-based queries |
@@ -179,6 +181,7 @@ waveq values <vcd> <time> <signal> [...]
 waveq changes <vcd> <signal> <start> <end>
 waveq edges <vcd> <signal> --kind rise --start 0ns --end 50ns
 waveq digest <vcd> <center> <radius> [--scope <hier>]
+waveq find <vcd> "tb.valid==1" "tb.ready==1" [--clock tb.clk] [--sample before|at] [--limit N]
 ```
 
 ## Development

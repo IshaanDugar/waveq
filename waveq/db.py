@@ -10,11 +10,18 @@ import re
 import sqlite3
 import time
 
+from . import __version__
 from .timeparse import Timescale
 
-_SCHEMA_VERSION = 2
+# v3: same-value re-dumps are no longer stored as changes; header parsing is token-based.
+_SCHEMA_VERSION = 3
 _UNIT_RE = re.compile(r"\b(1|10|100)\s*(fs|ps|ns|us|ms|s)\b", re.IGNORECASE)
 _INDEX_LEVELS = ("metadata", "changes", "runs", "edges")
+# Body directives whose contents are ordinary value changes; their closing $end is a no-op.
+_DUMP_BLOCKS = frozenset({"$dumpvars", "$dumpall", "$dumpon", "$dumpoff", "$end"})
+
+EDGE_KINDS = ("rise", "fall", "x_enter", "x_exit", "z_enter", "z_exit", "scalar_change", "vector_change")
+CLOCK_EDGE_KINDS = ("rise", "fall")
 
 @dataclass(frozen=True)
 class SignalDef:
@@ -183,20 +190,37 @@ def _open_text(path: Path) -> TextIO:
     return open(path, "rt", encoding="utf-8", errors="replace")
 
 
-def _strip_end(line: str) -> str:
-    return line.replace("$end", "").strip()
+def _iter_header_directives(fh: TextIO) -> Iterator[tuple[str, list[str]]]:
+    """Yield (keyword, args) for each header directive up to and including $enddefinitions.
+
+    Tokenizes on whitespace, so directives may span several lines or share one line, and
+    text inside $comment/$date/$version can never be mistaken for a $var or $scope.
+    """
+    keyword: str | None = None
+    args: list[str] = []
+    for raw_line in fh:
+        for tok in raw_line.split():
+            if keyword is None:
+                if tok.startswith("$"):
+                    keyword, args = tok, []
+                continue
+            if tok == "$end":
+                yield keyword, args
+                if keyword == "$enddefinitions":
+                    return
+                keyword = None
+            else:
+                args.append(tok)
+    if keyword is not None:
+        raise ValueError(f"unterminated {keyword} directive in VCD header")
+    raise ValueError("VCD header has no $enddefinitions")
 
 
-def _parse_timescale(line: str, fh: TextIO) -> Timescale:
-    text = line.strip()
-    while "$end" not in text:
-        nxt = fh.readline()
-        if not nxt:
-            raise ValueError("unterminated $timescale directive")
-        text += " " + nxt.strip()
+def _parse_timescale(args: list[str]) -> Timescale:
+    text = " ".join(args)
     m = _UNIT_RE.search(text)
     if not m:
-        raise ValueError(f"unsupported or malformed timescale directive: {text}")
+        raise ValueError(f"unsupported or malformed timescale directive: $timescale {text} $end")
     return Timescale(int(m.group(1)), m.group(2).lower())
 
 
@@ -211,25 +235,42 @@ def _leaf_from_ref(reference: str) -> str:
     return re.sub(r"\s*\[[^\]]+\]\s*$", "", ref)
 
 
-def _parse_var(line: str, stack: list[str], signal_id: int) -> SignalDef:
-    text = line.strip()
-    while "$end" not in text:
-        raise ValueError("multi-line $var directives are not supported")
-    text = _strip_end(text)
-    parts = text.split()
-    if len(parts) < 5 or parts[0] != "$var":
-        raise ValueError(f"malformed $var directive: {line.strip()}")
-    kind = parts[1]
+def _parse_var(args: list[str], stack: list[str], signal_id: int) -> SignalDef:
+    text = f"$var {' '.join(args)} $end"
+    if len(args) < 4:
+        raise ValueError(f"malformed $var directive: {text}")
+    kind = args[0]
     try:
-        width = int(parts[2])
+        width = int(args[1])
     except ValueError as exc:
-        raise ValueError(f"malformed $var width in: {line.strip()}") from exc
-    id_code = parts[3]
-    reference = " ".join(parts[4:])
+        raise ValueError(f"malformed $var width in: {text}") from exc
+    id_code = args[2]
+    reference = " ".join(args[3:])
     scope = _scope_path(stack)
     full = f"{scope}.{reference}" if scope else reference
     leaf = _leaf_from_ref(reference)
     return SignalDef(signal_id, id_code, full, scope, leaf, kind, width)
+
+
+def _parse_header_stream(fh: TextIO) -> tuple[Timescale, list[SignalDef]]:
+    """Consume the VCD header from fh, leaving it positioned at the first body line."""
+    timescale: Timescale | None = None
+    signal_defs: list[SignalDef] = []
+    scope_stack: list[str] = []
+    for keyword, args in _iter_header_directives(fh):
+        if keyword == "$timescale":
+            timescale = _parse_timescale(args)
+        elif keyword == "$scope":
+            # Always push (even an unnamed scope) so $upscope stays balanced.
+            scope_stack.append(" ".join(args[1:]))
+        elif keyword == "$upscope":
+            if scope_stack:
+                scope_stack.pop()
+        elif keyword == "$var":
+            signal_defs.append(_parse_var(args, scope_stack, len(signal_defs) + 1))
+    if timescale is None:
+        raise ValueError("VCD has no $timescale")
+    return timescale, signal_defs
 
 
 def _canonical_scalar(ch: str) -> str:
@@ -391,6 +432,41 @@ def _create_indexes(con: sqlite3.Connection, level: str) -> None:
         )
 
 
+def rebuild_clock_edges(con: sqlite3.Connection, signal_id: int, edge_kind: str) -> int:
+    """(Re)derive the cycle index for one clock from signal_edges. Returns the cycle count."""
+    con.execute("DELETE FROM clock_edges WHERE clock_signal_id=? AND edge_kind=?", (signal_id, edge_kind))
+    con.execute(
+        """
+        INSERT INTO clock_edges(clock_signal_id, edge_kind, cycle_index, tick)
+        SELECT signal_id, edge_kind, ROW_NUMBER() OVER (ORDER BY tick) - 1, tick
+        FROM signal_edges WHERE signal_id=? AND edge_kind=?
+        """,
+        (signal_id, edge_kind),
+    )
+    return int(con.execute(
+        "SELECT COUNT(*) FROM clock_edges WHERE clock_signal_id=? AND edge_kind=?", (signal_id, edge_kind)
+    ).fetchone()[0])
+
+
+def _existing_clock_defs(db_path: Path) -> list[tuple[str, str]]:
+    """Clock definitions (full_path, edge_kind) in an existing cache, so rebuilds can keep them."""
+    if not db_path.exists():
+        return []
+    try:
+        con = connect(db_path, readonly=True)
+        try:
+            return [
+                (r["full_path"], r["edge_kind"])
+                for r in con.execute(
+                    "SELECT DISTINCT s.full_path, c.edge_kind FROM clock_edges c JOIN signals s ON s.signal_id=c.clock_signal_id"
+                )
+            ]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
 def _insert_meta(con: sqlite3.Connection, rows: dict[str, str]) -> None:
     con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", rows.items())
 
@@ -444,7 +520,7 @@ def _base_meta(source: Path, source_stat: os.stat_result, timescale: Timescale |
         "vcd_size": str(source_stat.st_size),
         "source_mtime_ns": str(source_stat.st_mtime_ns),
         "vcd_mtime": str(source_stat.st_mtime_ns),
-        "waveq_version": "2",
+        "waveq_version": __version__,
         "signal_count": str(signal_count),
         "change_count": "0",
         "run_count": "0",
@@ -463,38 +539,8 @@ def _base_meta(source: Path, source_stat: os.stat_result, timescale: Timescale |
 
 
 def _parse_header(source: Path) -> tuple[Timescale, list[SignalDef]]:
-    signal_defs: list[SignalDef] = []
-    timescale: Timescale | None = None
-    scope_stack: list[str] = []
-    next_signal_id = 1
     with _open_text(source) as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("$timescale"):
-                timescale = _parse_timescale(line, fh)
-                continue
-            if line.startswith("$scope"):
-                text = _strip_end(line)
-                parts = text.split(maxsplit=2)
-                if len(parts) >= 3:
-                    scope_stack.append(parts[2])
-                continue
-            if line.startswith("$upscope"):
-                if scope_stack:
-                    scope_stack.pop()
-                continue
-            if line.startswith("$var"):
-                sig = _parse_var(line, scope_stack, next_signal_id)
-                next_signal_id += 1
-                signal_defs.append(sig)
-                continue
-            if line.startswith("$enddefinitions"):
-                break
-    if timescale is None:
-        raise ValueError("VCD has no $timescale")
-    return timescale, signal_defs
+        return _parse_header_stream(fh)
 
 
 def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *, rebuild: bool = False) -> BuildStats:
@@ -608,6 +654,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
             reused=True,
         )
 
+    carried_clocks = _existing_clock_defs(db_path) if build_edges else []
     tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
     if tmp_path.exists():
         tmp_path.unlink()
@@ -628,11 +675,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         "ready_runs": "0",
         "ready_edges": "0",
     })
-    signal_defs: list[SignalDef] = []
     id_to_signals: dict[str, list[SignalDef]] = {}
-    timescale: Timescale | None = None
-    scope_stack: list[str] = []
-    next_signal_id = 1
     current_tick = 0
     min_tick: int | None = None
     max_tick = 0
@@ -644,10 +687,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     current_value: dict[int, str] = {}
     current_run_start: dict[int, int] = {}
     pending_final_by_id: dict[str, str] = {}
-    signal_by_id: dict[int, SignalDef] = {}
-    in_header = True
-    in_dumpvars = False
-    signal_rows_inserted = False
+    last_raw_by_id: dict[str, str] = {}
     changes_batch: list[tuple[int, int, int, int]] = []
     runs_batch: list[tuple[int, int, int, int]] = []
     edges_batch: list[tuple[int, int, int, int, str]] = []
@@ -669,7 +709,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         value_ids[raw] = vid
         return vid
 
-    x_value_id = value_id("x")
+    value_id("x")  # every signal starts as x before its first dump
 
     def flush_batches(force: bool = False) -> None:
         nonlocal changes_batch, runs_batch, edges_batch
@@ -686,24 +726,10 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
             )
             edges_batch = []
 
-    def insert_signal_rows_once() -> None:
-        nonlocal signal_rows_inserted
-        if signal_rows_inserted:
-            return
-        if timescale is None:
-            raise ValueError("VCD has no $timescale before changes")
-        _insert_signals(con, signal_defs)
-        for s in signal_defs:
-            signal_by_id[s.signal_id] = s
-            current_value[s.signal_id] = "x"
-            current_run_start[s.signal_id] = 0
-        signal_rows_inserted = True
-
     def flush_pending(final_tick: int) -> None:
         nonlocal run_count, edge_count, pending_final_by_id
         if not pending_final_by_id:
             return
-        insert_signal_rows_once()
         for id_code, raw in list(pending_final_by_id.items()):
             for sig in id_to_signals.get(id_code, []):
                 prev = current_value.get(sig.signal_id, "x")
@@ -722,16 +748,18 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         flush_batches()
 
     def record_change(raw: str, id_code: str) -> None:
-        nonlocal change_count, ordinal, min_tick, max_tick
-        insert_signal_rows_once()
-        if id_code not in id_to_signals:
-            # Some VCDs contain comments or unsupported constructs in dump sections.
+        nonlocal change_count, ordinal, min_tick
+        sigs = id_to_signals.get(id_code)
+        if not sigs:
             return
+        if last_raw_by_id.get(id_code) == raw:
+            # Re-dump of the value already held ($dumpall, $dumpon, redundant writes): not a change.
+            return
+        last_raw_by_id[id_code] = raw
         if min_tick is None:
             min_tick = current_tick
-        max_tick = max(max_tick, current_tick)
         vid = value_id(raw)
-        for sig in id_to_signals[id_code]:
+        for sig in sigs:
             ordinal += 1
             changes_batch.append((sig.signal_id, current_tick, ordinal, vid))
             change_count += 1
@@ -739,43 +767,24 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         flush_batches()
 
     with _open_text(source) as fh:
+        timescale, signal_defs = _parse_header_stream(fh)
+        for sig in signal_defs:
+            id_to_signals.setdefault(sig.id_code, []).append(sig)
+            current_value[sig.signal_id] = "x"
+            current_run_start[sig.signal_id] = 0
+        _insert_signals(con, signal_defs)
+
+        skip_until_end = False
         for raw_line in fh:
             line = raw_line.strip()
             if not line:
                 continue
-            if in_header:
-                if line.startswith("$timescale"):
-                    timescale = _parse_timescale(line, fh)
-                    continue
-                if line.startswith("$scope"):
-                    text = _strip_end(line)
-                    parts = text.split(maxsplit=2)
-                    if len(parts) >= 3:
-                        scope_stack.append(parts[2])
-                    continue
-                if line.startswith("$upscope"):
-                    if scope_stack:
-                        scope_stack.pop()
-                    continue
-                if line.startswith("$var"):
-                    sig = _parse_var(line, scope_stack, next_signal_id)
-                    next_signal_id += 1
-                    signal_defs.append(sig)
-                    id_to_signals.setdefault(sig.id_code, []).append(sig)
-                    continue
-                if line.startswith("$enddefinitions"):
-                    in_header = False
-                    insert_signal_rows_once()
-                    continue
+            if skip_until_end:
+                if line == "$end" or line.endswith((" $end", "	$end")):
+                    skip_until_end = False
                 continue
-
-            if line.startswith("$dumpvars"):
-                in_dumpvars = True
-                continue
-            if line.startswith("$end") and in_dumpvars:
-                in_dumpvars = False
-                continue
-            if line.startswith("#"):
+            first = line[0]
+            if first == "#":
                 flush_pending(current_tick)
                 try:
                     current_tick = int(line[1:].strip())
@@ -783,7 +792,13 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
                     raise ValueError(f"malformed VCD timestamp: {line!r}") from exc
                 max_tick = max(max_tick, current_tick)
                 continue
-            first = line[0]
+            if first == "$":
+                # Skip non-dump directives such as a multi-line $comment through their $end,
+                # so their text is never misread as value changes.
+                keyword = line.split(maxsplit=1)[0]
+                if keyword not in _DUMP_BLOCKS and not line.endswith((" $end", "	$end")):
+                    skip_until_end = True
+                continue
             if first in "01xXzZ":
                 record_change(_canonical_scalar(first), line[1:].strip())
                 continue
@@ -793,10 +808,8 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
                     continue
                 record_change(_canonical_vector(first, parts[0][1:]), parts[1].strip())
                 continue
-            # Ignore comments and unsupported dump directives, not unknown data.
+            # Ignore anything else that is not a recognizable value change.
 
-    if timescale is None:
-        raise ValueError("VCD has no $timescale")
     flush_pending(current_tick)
     end_tick = max_tick + 1
     if build_runs:
@@ -822,6 +835,11 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     })
     _insert_meta(con, meta)
     _create_indexes(con, level)
+    # Keep clocks defined against the previous cache; re-derive them from the new edges.
+    for full_path, edge_kind in carried_clocks:
+        row = con.execute("SELECT signal_id FROM signals WHERE full_path=?", (full_path,)).fetchone()
+        if row:
+            rebuild_clock_edges(con, int(row[0]), edge_kind)
     con.execute("ANALYZE")
     con.execute("PRAGMA optimize")
     con.commit()
