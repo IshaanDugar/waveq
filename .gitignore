@@ -25,3 +25,7 @@ reports/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Hallmark design-run working files
+.hallmark/
+site/.hallmark/

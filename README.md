@@ -10,6 +10,8 @@ WaveQ is a local [MCP](https://modelcontextprotocol.io/) server and CLI that ind
 
 Zero runtime dependencies. Pure Python. Runs entirely on your machine.
 
+See how it works, with diagrams drawn from a real dump: **[ishaandugar.github.io/waveq](https://ishaandugar.github.io/waveq/)**
+
 ## Quick start
 
 **Requirements:** Python 3.10+

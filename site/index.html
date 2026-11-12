@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WaveQ: exact VCD waveform answers for AI agents</title>
+<meta name="description" content="WaveQ is a local MCP server and CLI that indexes VCD waveform files so AI agents can ask for exact signal values instead of reading raw dumps.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="container nav__inner">
+    <a class="wordmark" href="./" aria-label="WaveQ home">WaveQ</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a href="#how">How it works</a>
+      <a href="#connect">Install</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero">
+  <div class="container hero__grid">
+    <div class="hero__text">
+      <h1>Can your AI agent read a waveform?</h1>
+      <p class="lead">WaveQ indexes VCD files so your agent can ask for exact values.</p>
+      <div class="hero__actions">
+        <div class="cmd cut">
+          <code id="cmd-hero">git clone https://github.com/<wbr>IshaanDugar/waveq</code>
+          <button class="key key--copy" type="button" data-copy="cmd-hero">Copy</button>
+        </div>
+        <div class="hero__go">
+          <a class="key key--primary" href="https://github.com/IshaanDugar/waveq">Get it on GitHub</a>
+          <p class="terms">MIT licence. Needs Python 3.10 or newer<br>and nothing else.</p>
+        </div>
+      </div>
+    </div>
+
+    <figure class="mapping" data-mapping aria-label="Raw VCD lines from sample.vcd mapped to the JSON answer WaveQ returns for value_at tb.valid at 16 ns">
+      <div class="pane graphite cut">
+        <div class="pane__head"><code>sample.vcd</code></div>
+<pre class="pane__body"><code><span>$var wire 1 ! clk $end</span>
+<span class="hit" data-from="a">$var wire 1 # valid $end</span>
+<span>$var wire 1 $ ready $end</span>
+<span class="skipline">…</span>
+<span>#10</span>
+<span>0!</span>
+<span>1"</span>
+<span class="ctx">#15</span>
+<span>1!</span>
+<span class="hit" data-from="b">1#</span>
+<span>b10100101 %</span>
+<span>#20</span>
+<span>0!</span>
+<span>1$</span>
+<span class="skipline">…</span>
+<span class="ctx">#40</span>
+<span>0!</span>
+<span>0&amp;</span>
+<span>0'</span>
+<span class="hit" data-from="c">0#</span>
+<span>0$</span></code></pre>
+      </div>
+
+      <svg class="mapping__links" aria-hidden="true" focusable="false"></svg>
+
+      <div class="pane graphite cut pane--answer">
+        <div class="pane__head"><code>value_at("tb.valid", "16ns")</code></div>
+<pre class="pane__body"><code><span class="ctx">{</span>
+<span>  "ok": <b class="token">true</b>,</span>
+<span>  "data": {</span>
+<span class="hit" data-to="a">    "signal": <b class="token">"tb.valid"</b>,</span>
+<span>    "time": <b class="token">"16ns"</b>,</span>
+<span>    "value": <b class="token">"1"</b>,</span>
+<span class="hit" data-to="b">    "held_from_time": <b class="token">"15ns"</b>,</span>
+<span class="hit" data-to="c">    "held_until_time_exclusive": <b class="token">"40ns"</b></span>
+<span class="skipline">    …</span>
+<span>  }</span>
+<span class="ctx">}</span></code></pre>
+      </div>
+      <figcaption>In this dump, <code>#</code> stands for valid. The answer on the right comes from the three lit lines.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="qa qa--split" id="vcd" aria-labelledby="vcd-q">
+  <div class="container split">
+    <div class="split__text">
+      <h2 id="vcd-q">What’s in a VCD file?</h2>
+      <p>A simulator writes a line each time a signal changes, after a line that says when. Your waveform viewer draws this picture from those lines.</p>
+    </div>
+    <figure class="split__visual plate">
+<div class="plate__scroll" tabindex="0" role="region" aria-label="Diagram, scrolls sideways on small screens">
+<!-- diagram:vcd -->
+<svg class="diagram" viewBox="0 0 640 366" role="img" aria-label="Waveform diagram of examples/sample.vcd from 0 to 50 ns: clk toggles every 5 ns, rst_n rises at 10 ns, valid is high 15 to 40 ns, ready 20 to 40 ns, data becomes A5 at 15 ns, psel is high 25 to 40 ns and penable 30 to 40 ns.">
+<line class="axis" x1="104" y1="338" x2="624" y2="338"/>
+<line class="grid" x1="104.0" y1="4" x2="104.0" y2="338"/>
+<text class="tick" x="104.0" y="356">0</text>
+<line class="grid" x1="208.0" y1="4" x2="208.0" y2="338"/>
+<text class="tick" x="208.0" y="356">10</text>
+<line class="grid" x1="312.0" y1="4" x2="312.0" y2="338"/>
+<text class="tick" x="312.0" y="356">20</text>
+<line class="grid" x1="416.0" y1="4" x2="416.0" y2="338"/>
+<text class="tick" x="416.0" y="356">30</text>
+<line class="grid" x1="520.0" y1="4" x2="520.0" y2="338"/>
+<text class="tick" x="520.0" y="356">40</text>
+<line class="grid" x1="624.0" y1="4" x2="624.0" y2="338"/>
+<text class="tick" x="624.0" y="356">50 ns</text>
+<text class="lane" x="0" y="26.0">clk</text>
+<path class="wave" d="M104.0 34 H156.0 V8 H208.0 V34 H260.0 V8 H312.0 V34 H364.0 V8 H416.0 V34 H468.0 V8 H520.0 V34 H572.0 V8 H624.0 V34 H624.0"/>
+<text class="lane" x="0" y="74.0">rst_n</text>
+<path class="wave" d="M104.0 82 H208.0 V56 H624.0"/>
+<text class="lane" x="0" y="122.0">valid</text>
+<path class="wave" d="M104.0 130 H260.0 V104 H520.0 V130 H624.0"/>
+<text class="lane" x="0" y="170.0">ready</text>
+<path class="wave" d="M104.0 178 H312.0 V152 H520.0 V178 H624.0"/>
+<text class="lane" x="0" y="218.0">data[7:0]</text>
+<path class="bus" d="M104.0 213.0 L104.0 200 H256.0 L260.0 213.0 L256.0 226 H104.0 Z"/>
+<text class="bus-label" x="182.0" y="213.0">00</text>
+<path class="bus" d="M260.0 213.0 L264.0 200 H624.0 L624.0 213.0 L624.0 226 H264.0 Z"/>
+<text class="bus-label" x="442.0" y="213.0">A5</text>
+<text class="lane" x="0" y="266.0">psel</text>
+<path class="wave" d="M104.0 274 H364.0 V248 H520.0 V274 H624.0"/>
+<text class="lane" x="0" y="314.0">penable</text>
+<path class="wave" d="M104.0 322 H416.0 V296 H520.0 V322 H624.0"/>
+</svg>
+<!-- /diagram:vcd -->
+</div>
+      <figcaption><code>examples/sample.vcd</code> from 0 to 50 ns. Each step in a trace is one line of the file.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="qa band" id="why" aria-labelledby="why-q">
+  <div class="container">
+    <div class="qa__head">
+      <h2 id="why-q">Why not paste the VCD into the chat?</h2>
+      <p class="lead">It won’t fit, and the agent would end up guessing.</p>
+    </div>
+    <table class="compare">
+      <thead>
+        <tr><th scope="col"><span class="visually-hidden">Question</span></th><th scope="col">Raw VCD in the chat</th><th scope="col">With WaveQ</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">Size</th><td>Millions of tokens for 12 MB</td><td><code>window_digest</code> sends a short summary</td></tr>
+        <tr><th scope="row">Names</th><td>Guesses the hierarchy</td><td><code>resolve_signals</code> finds exact paths</td></tr>
+        <tr class="compare__lit"><th scope="row">Repeat questions</th><td>Reads the file again</td><td>Cache reattaches in about 1.5 ms</td></tr>
+        <tr><th scope="row">Many signals</th><td>One scan per signal</td><td><code>values_at</code> reads eight in under 1 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="qa" id="how" aria-labelledby="how-q">
+  <div class="container">
+    <div class="qa__head">
+      <h2 id="how-q">How does it answer so fast?</h2>
+      <p class="lead">It reads the dump once into three SQLite tables, then looks things up.</p>
+    </div>
+    <figure class="plate plate--wide">
+<div class="plate__scroll" tabindex="0" role="region" aria-label="Diagram, scrolls sideways on small screens">
+<!-- diagram:index -->
+<svg class="diagram diagram--wide" viewBox="0 0 1200 304" role="img" aria-label="Index diagram for tb.valid in sample.vcd: the changes table holds 0 at 0 ns, 1 at 15 ns and 0 at 40 ns; the runs table holds 0 from 0 to 15 ns, 1 from 15 to 40 ns and 0 from 40 to 51 ns; the edges table holds a rise at 15 ns and a fall at 40 ns. A query at 16 ns lands in the run from 15 to 40 ns, so the answer is 1.">
+<text class="lane" x="0" y="55">tb.valid</text>
+<text class="lane" x="0" y="135">changes</text>
+<text class="lane" x="0" y="199">runs</text>
+<text class="lane" x="0" y="275">edges</text>
+<path class="wave" d="M120.0 66 H430.59 V36 H948.24 V66 H1176.0"/>
+<line class="rail" x1="120.0" y1="130" x2="1176.0" y2="130"/>
+<circle class="dot" cx="120.0" cy="130" r="5"/>
+<text class="note" x="130.0" y="135">0 ns → 0</text>
+<circle class="dot" cx="430.59" cy="130" r="5"/>
+<text class="note" text-anchor="end" x="420.59" y="135">15 ns → 1</text>
+<circle class="dot" cx="948.24" cy="130" r="5"/>
+<text class="note" text-anchor="end" x="938.24" y="135">40 ns → 0</text>
+<rect class="run" x="122.0" y="180" width="306.59" height="40" rx="4"/>
+<text class="run-label" x="275.29" y="205">0 from 0 to 15 ns</text>
+<rect class="run run--hit" x="432.59" y="180" width="513.65" height="40" rx="4"/>
+<text class="run-label run-label--hit" x="689.41" y="205">1 from 15 to 40 ns</text>
+<rect class="run" x="950.24" y="180" width="223.76" height="40" rx="4"/>
+<text class="run-label" x="1062.12" y="205">0 from 40 to 51 ns</text>
+<line class="rail" x1="120.0" y1="270" x2="1176.0" y2="270"/>
+<path class="edge-mark" d="M120.0 262 L127.0 270 L120.0 278 L113.0 270 Z"/>
+<text class="note" x="134.0" y="275">x_exit</text>
+<path class="edge-mark" d="M424.59 280 L430.59 260 L436.59 280"/>
+<text class="note" text-anchor="end" x="416.59" y="275">rise</text>
+<path class="edge-mark" d="M942.24 260 L948.24 280 L954.24 260"/>
+<text class="note" text-anchor="end" x="934.24" y="275">fall</text>
+<line class="cursor" x1="451.29" y1="10" x2="451.29" y2="224"/>
+<text class="cursor-label" x="459.29" y="18">value_at 16 ns</text>
+</svg>
+<!-- /diagram:index -->
+</div>
+    </figure>
+    <dl class="tables">
+      <div><dt><code>changes</code></dt><dd>Every transition, in order.</dd></div>
+      <div><dt><code>runs</code></dt><dd>Each stretch a value held. <code>value_at</code> finds yours.</dd></div>
+      <div><dt><code>edges</code></dt><dd>Rises, falls, x and z. Clocks come from here.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section class="qa qa--split" id="find" aria-labelledby="find-q">
+  <div class="container split split--flip">
+    <figure class="split__visual plate">
+<div class="plate__scroll" tabindex="0" role="region" aria-label="Diagram, scrolls sideways on small screens">
+<!-- diagram:find -->
+<svg class="diagram" viewBox="0 0 640 224" role="img" aria-label="Diagram of find_times on sample.vcd: rising clk edges at 5, 15, 25, 35 and 45 ns, with psel and penable sampled one tick before each edge. psel rises exactly at the 25 ns edge, so the sample at 24 ns still reads 0. Only the 35 ns edge, cycle 3, sees both high.">
+<line class="axis" x1="104" y1="196" x2="624" y2="196"/>
+<line class="grid" x1="104.0" y1="26" x2="104.0" y2="196"/>
+<text class="tick" x="104.0" y="214">0</text>
+<line class="grid" x1="208.0" y1="26" x2="208.0" y2="196"/>
+<text class="tick" x="208.0" y="214">10</text>
+<line class="grid" x1="312.0" y1="26" x2="312.0" y2="196"/>
+<text class="tick" x="312.0" y="214">20</text>
+<line class="grid" x1="416.0" y1="26" x2="416.0" y2="196"/>
+<text class="tick" x="416.0" y="214">30</text>
+<line class="grid" x1="520.0" y1="26" x2="520.0" y2="196"/>
+<text class="tick" x="520.0" y="214">40</text>
+<line class="grid" x1="624.0" y1="26" x2="624.0" y2="196"/>
+<text class="tick" x="624.0" y="214">50 ns</text>
+<rect class="match-band" x="450.6" y="22" width="24.4" height="162" rx="4"/>
+<text class="lane" x="0" y="52.0">clk</text>
+<path class="wave" d="M104.0 60 H156.0 V34 H208.0 V60 H260.0 V34 H312.0 V60 H364.0 V34 H416.0 V60 H468.0 V34 H520.0 V60 H572.0 V34 H624.0 V60 H624.0"/>
+<text class="lane" x="0" y="108.0">psel</text>
+<path class="wave" d="M104.0 116 H364.0 V90 H520.0 V116 H624.0"/>
+<text class="lane" x="0" y="164.0">penable</text>
+<path class="wave" d="M104.0 172 H416.0 V146 H520.0 V172 H624.0"/>
+<line class="edge-line" x1="156.0" y1="26" x2="156.0" y2="180"/>
+<circle class="sample" cx="145.6" cy="116" r="4"/>
+<circle class="sample" cx="145.6" cy="172" r="4"/>
+<line class="edge-line" x1="260.0" y1="26" x2="260.0" y2="180"/>
+<circle class="sample" cx="249.6" cy="116" r="4"/>
+<circle class="sample" cx="249.6" cy="172" r="4"/>
+<line class="edge-line" x1="364.0" y1="26" x2="364.0" y2="180"/>
+<circle class="sample" cx="353.6" cy="116" r="4"/>
+<circle class="sample" cx="353.6" cy="172" r="4"/>
+<text class="cursor-label" x="478.0" y="16">cycle 3, sampled at 34 ns</text>
+<line class="edge-line edge-line--hit" x1="468.0" y1="26" x2="468.0" y2="180"/>
+<circle class="sample sample--hit" cx="457.6" cy="90" r="4"/>
+<circle class="sample sample--hit" cx="457.6" cy="146" r="4"/>
+<line class="edge-line" x1="572.0" y1="26" x2="572.0" y2="180"/>
+<circle class="sample" cx="561.6" cy="116" r="4"/>
+<circle class="sample" cx="561.6" cy="172" r="4"/>
+</svg>
+<!-- /diagram:find -->
+</div>
+      <figcaption>psel rises on the 25 ns edge itself, so a flop clocked there still sees 0.</figcaption>
+    </figure>
+    <div class="split__text">
+      <h2 id="find-q">Can it find when something happened?</h2>
+      <p>With a clock, <code>find_times</code> reads each signal one tick before the edge, as a flip-flop does.</p>
+      <div class="graphite cut snippet">
+<pre><code>find_times({
+  "conditions": [
+    {"signal": "psel", "value": "1"},
+    {"signal": "penable", "value": "1"}],
+  "clock": "clk"})
+<b class="token">cycle 3, edge at 35ns, sampled at 34</b></code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="qa" id="honest" aria-labelledby="honest-q">
+  <div class="container">
+    <div class="qa__head qa__head--split">
+      <h2 id="honest-q">What if the answer isn’t there?</h2>
+      <p class="lead">It says so, and <code>ok: false</code> tells the agent to stop.</p>
+    </div>
+    <ul class="fails">
+      <li><code class="fails__call">value_at("tb.vaild", "16ns")</code><code class="fails__reply"><b>not_found</b> No signal matched 'tb.vaild'</code></li>
+      <li><code class="fails__call">value_at("tb.valid", "0.5ns")</code><code class="fails__reply"><b>value_at_failed</b> '0.5ns' is not representable at timescale 1ns</code></li>
+      <li><code class="fails__call">changes("tb.valid", "0ns", "500ns")</code><code class="fails__reply"><b>time_out_of_range</b> time 500ns is outside waveform range 0ns..50ns</code></li>
+    </ul>
+  </div>
+</section>
+
+<section class="qa" id="connect" aria-labelledby="connect-q">
+  <div class="container connect">
+    <div class="connect__install">
+      <h2 id="connect-q">How do I connect it?</h2>
+      <p>Install once, then add one entry to your MCP client.</p>
+      <div class="graphite cut snippet">
+        <div class="pane__head"><code>terminal</code></div>
+<pre><code>git clone https://github.com/IshaanDugar/waveq
+cd waveq
+python -m venv .venv
+.venv/bin/pip install -e .</code></pre>
+      </div>
+      <p class="aside">Windows: <code>.venv\Scripts\pip install -e .</code></p>
+    </div>
+    <div class="switch" data-switch>
+      <div class="tray" role="tablist" aria-label="MCP client">
+        <button class="tab" type="button" role="tab" id="tab-claude" aria-selected="true" aria-controls="cfg-claude">Claude Desktop</button>
+        <button class="tab" type="button" role="tab" id="tab-cursor" aria-selected="false" aria-controls="cfg-cursor" tabindex="-1">Cursor</button>
+        <button class="tab" type="button" role="tab" id="tab-codex" aria-selected="false" aria-controls="cfg-codex" tabindex="-1">Codex</button>
+      </div>
+      <div class="graphite cut snippet" role="tabpanel" id="cfg-claude" aria-labelledby="tab-claude">
+        <div class="pane__head"><code>claude_desktop_config.json</code></div>
+<pre><code>{
+  "mcpServers": {
+    "waveq": {
+      "command": "/path/to/waveq/.venv/bin/python",
+      "args": ["-m", "waveq.mcp_server"],
+      "cwd": "/path/to/waveq"
+    }
+  }
+}</code></pre>
+      </div>
+      <div class="graphite cut snippet" role="tabpanel" id="cfg-cursor" aria-labelledby="tab-cursor">
+        <div class="pane__head"><code>~/.cursor/mcp.json</code></div>
+<pre><code>{
+  "mcpServers": {
+    "waveq": {
+      "command": "/path/to/waveq/.venv/bin/python",
+      "args": ["-m", "waveq.mcp_server"],
+      "cwd": "/path/to/waveq"
+    }
+  }
+}</code></pre>
+      </div>
+      <div class="graphite cut snippet" role="tabpanel" id="cfg-codex" aria-labelledby="tab-codex">
+        <div class="pane__head"><code>~/.codex/config.toml</code></div>
+<pre><code>[mcp_servers.waveq]
+command = "/path/to/waveq/.venv/bin/python"
+args = ["-m", "waveq.mcp_server"]
+cwd = "/path/to/waveq"</code></pre>
+      </div>
+      <p class="aside">Guides: <a href="https://github.com/IshaanDugar/waveq/blob/main/docs/install/mcp-clients.md">every client</a>, <a href="https://github.com/IshaanDugar/waveq/blob/main/docs/install/codex-windows.md">Codex on Windows</a>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="close band" aria-labelledby="close-q">
+  <div class="container close__inner">
+    <h2 id="close-q">Point your agent at a dump.</h2>
+    <div class="close__actions">
+      <div class="cmd cut">
+        <code id="cmd-close">git clone https://github.com/<wbr>IshaanDugar/waveq</code>
+        <button class="key key--copy" type="button" data-copy="cmd-close">Copy</button>
+      </div>
+      <a class="key key--primary" href="https://github.com/IshaanDugar/waveq">Get it on GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="container foot__grid">
+    <div class="foot__mark">
+      <a class="wordmark" href="./" aria-label="WaveQ home">WaveQ</a>
+      <p>A local MCP server and CLI for VCD waveforms.</p>
+    </div>
+    <nav aria-label="Project">
+      <h3>Project</h3>
+      <ul>
+        <li><a href="https://github.com/IshaanDugar/waveq">Source</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/CHANGELOG.md">Changelog</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/issues">Issues</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/LICENSE">MIT licence</a></li>
+      </ul>
+    </nav>
+    <nav aria-label="Guides">
+      <h3>Guides</h3>
+      <ul>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/docs/install/mcp-clients.md">MCP client setup</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/docs/install/codex-windows.md">Codex on Windows</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/AGENTS.md">Agent workflow</a></li>
+        <li><a href="https://github.com/IshaanDugar/waveq/blob/main/SECURITY.md">Security policy</a></li>
+      </ul>
+    </nav>
+    <p class="foot__legal">Made by Ishaan Dugar.</p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  // Copy keys
+  document.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const text = document.getElementById(btn.dataset.copy).textContent.trim();
+      try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+      catch { btn.textContent = 'Select and copy'; }
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1600);
+    });
+  });
+
+  // Hairline elbows joining matched lines in a mapping figure
+  const NS = 'http://www.w3.org/2000/svg';
+  const drawLinks = (fig) => {
+    const svg = fig.querySelector('.mapping__links');
+    if (!svg || getComputedStyle(svg).display === 'none') return;
+    const box = fig.getBoundingClientRect();
+    svg.setAttribute('viewBox', `0 0 ${box.width} ${box.height}`);
+    svg.setAttribute('width', box.width); svg.setAttribute('height', box.height);
+    svg.replaceChildren();
+    const froms = [...fig.querySelectorAll('[data-from]')];
+    froms.forEach((from, i) => {
+      const to = fig.querySelector(`[data-to="${from.dataset.from}"]`);
+      if (!to) return;
+      const a = from.closest('.pane').getBoundingClientRect(), fa = from.getBoundingClientRect();
+      const b = to.closest('.pane').getBoundingClientRect(), tb = to.getBoundingClientRect();
+      const x1 = a.right - box.left, y1 = fa.top + fa.height / 2 - box.top;
+      const x2 = b.left - box.left, y2 = tb.top + tb.height / 2 - box.top;
+      // each link gets its own vertical run so no two elbows overlap
+      const xm = x1 + ((x2 - x1) * (i + 1)) / (froms.length + 1);
+      const path = document.createElementNS(NS, 'path');
+      path.setAttribute('d', `M${x1} ${y1} H${xm} V${y2} H${x2}`);
+      svg.append(path);
+      [[x1, y1], [x2, y2]].forEach(([cx, cy]) => {
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', cx); c.setAttribute('cy', cy); c.setAttribute('r', 3);
+        svg.append(c);
+      });
+    });
+  };
+  // Client switcher: every panel shows without script; with it, one at a time
+  document.querySelectorAll('[data-switch]').forEach((sw) => {
+    const tabs = [...sw.querySelectorAll('[role="tab"]')];
+    const select = (tab, focus) => {
+      tabs.forEach((t) => {
+        const on = t === tab;
+        t.setAttribute('aria-selected', on);
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+      });
+      if (focus) tab.focus();
+    };
+    tabs.forEach((t, i) => {
+      t.addEventListener('click', () => select(t, false));
+      t.addEventListener('keydown', (ev) => {
+        const step = ev.key === 'ArrowRight' ? 1 : ev.key === 'ArrowLeft' ? -1 : 0;
+        if (step) { ev.preventDefault(); select(tabs[(i + step + tabs.length) % tabs.length], true); }
+      });
+    });
+    select(tabs.find((t) => t.getAttribute('aria-selected') === 'true') || tabs[0], false);
+  });
+
+  const figs = document.querySelectorAll('[data-mapping]');
+  const redraw = () => figs.forEach(drawLinks);
+  (document.fonts ? document.fonts.ready : Promise.resolve()).then(redraw);
+  new ResizeObserver(redraw).observe(document.body);
+})();
+</script>
+</body>
+</html>
