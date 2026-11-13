@@ -27,7 +27,7 @@ jobs:
       - name: Collect the published files
         run: |
           mkdir _site
-          cp site/index.html site/site.css site/tokens.css site/base.css _site/
+          cp site/index.html site/site.css site/tokens.css site/base.css site/og.png site/robots.txt site/sitemap.xml site/llms.txt _site/
 
       - uses: actions/configure-pages@v5
 

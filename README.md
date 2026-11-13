@@ -12,9 +12,31 @@ Zero runtime dependencies. Pure Python. Runs entirely on your machine.
 
 See how it works, with diagrams drawn from a real dump: **[ishaandugar.github.io/waveq](https://ishaandugar.github.io/waveq/)**
 
+[![A VCD dump, the same signals drawn as a waveform, and the exact JSON answer WaveQ returns](site/og.png)](https://ishaandugar.github.io/waveq/)
+
+Built for students, hobbyists and open-source hardware projects (cocotb, Verilator, Icarus, GHDL users): free, local, no accounts.
+
+<!-- mcp-name: io.github.IshaanDugar/waveq -->
+
 ## Quick start
 
 **Requirements:** Python 3.10+
+
+**Claude Code** (plugin with the MCP server and a debugging skill):
+
+```text
+/plugin install waveq --marketplace IshaanDugar/waveq
+```
+
+**Any MCP client**, with [uv](https://docs.astral.sh/uv/) (nothing to install by hand):
+
+```json
+{ "mcpServers": { "waveq": { "command": "uvx", "args": ["--from", "git+https://github.com/IshaanDugar/waveq", "waveq", "mcp"] } } }
+```
+
+**CLI:** `pip install git+https://github.com/IshaanDugar/waveq`, then `waveq --help`.
+
+**From source:**
 
 ```bash
 git clone https://github.com/IshaanDugar/waveq.git
@@ -79,7 +101,16 @@ See [AGENTS.md](AGENTS.md) for the recommended tool workflow.
 
 ## What it does not do
 
-WaveQ is **not** a simulator, waveform viewer, assertion engine, or protocol checker. It reports observed VCD facts. Do not use it alone to prove APB/AHB/AXI correctness, CDC safety, or formal properties. It does not read FSDB, VPD, or FST.
+WaveQ is **not** a simulator, waveform viewer, assertion engine, or protocol checker. It reports observed VCD facts. Do not use it alone to prove APB/AHB/AXI correctness, CDC safety, or formal properties. Commercial formats (FSDB, VPD, WLF, SHM) are out of scope: dump VCD from the simulator instead.
+
+## Formats
+
+| Format | Support |
+|---|---|
+| VCD, `.vcd.gz` | native |
+| Extended VCD (`.evcd`, IEEE 1364 port dumps) | native |
+| FST (Verilator, Icarus, GTKWave), LXT, LXT2, VZT | converted with GTKWave's open tools (`fst2vcd`, `lxt2vcd`, `vzt2vcd`) when they are on PATH; the result is cached and reused |
+| GHW (GHDL) | run GHDL with `--vcd=wave.vcd` or `--fst=wave.fst` |
 
 ## How it works
 

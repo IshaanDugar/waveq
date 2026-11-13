@@ -1,0 +1,43 @@
+{
+  "name": "waveq",
+  "version": "3.1.0",
+  "description": "Exact answers from VCD/FST simulation waveforms for AI agents: values, edges, cycles, X origins, hangs.",
+  "author": {
+    "name": "Ishaan Dugar",
+    "url": "https://github.com/IshaanDugar"
+  },
+  "homepage": "https://ishaandugar.github.io/waveq/",
+  "repository": "https://github.com/IshaanDugar/waveq",
+  "license": "MIT",
+  "keywords": [
+    "vcd",
+    "fst",
+    "waveform",
+    "verilog",
+    "systemverilog",
+    "vhdl",
+    "fpga",
+    "rtl",
+    "simulation",
+    "verification",
+    "cocotb",
+    "verilator",
+    "gtkwave",
+    "eda",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent",
+    "llm"
+  ],
+  "mcpServers": {
+    "waveq": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/IshaanDugar/waveq",
+        "waveq",
+        "mcp"
+      ]
+    }
+  }
+}

@@ -21,6 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `WAVEQ_CACHE_DIR` environment variable; the default cache moves to the per-user cache directory when the VCD's folder is synced (OneDrive, Dropbox, Google Drive, iCloud) or read-only
 - CLI commands `scopes`, `xreport`, `activity`, `transitions`, `pair`; `find --payload`; `--index` on every command that configures
 - `build_index` `signals`: index only the named signals. The whole dump is still parsed but only their rows are stored (6x faster build, 12x smaller cache for 4 of 128 signals in the benchmark dump); queries on other signals fail with `signal_not_indexed`, scope-wide tools say how many signals they skipped, and asking for more signals rebuilds with the union
+- Input formats: Extended VCD (`.evcd`, IEEE 1364 port dumps) is read natively; FST, LXT, LXT2 and VZT are converted with GTKWave's open tools (`fst2vcd`, `lxt2vcd`, `vzt2vcd`) when on PATH, cached, and reused until the source changes; GHW and closed formats get a one-line pointer to the right converter or simulator flag
+- `benchmarks/realistic_vcd.py`: generates an SoC-style dump with known answers (out-of-order AXI-style reads with one hung request, an FSM, an injected X, filler registers) and checks `pair_events`, `x_report`, `state_transitions`, `activity` and `first_divergence` against them; runs in CI at small size
+- Distribution: Claude Code plugin and marketplace (`/plugin install waveq --marketplace IshaanDugar/waveq`) with a waveform-debugging skill; `server.json` for the official MCP registry and a release workflow that publishes to PyPI and the registry; `uvx` one-line MCP config; site metadata (OpenGraph image, JSON-LD, `llms.txt`, sitemap)
 - `first_divergence` MCP tool and `waveq diff` CLI command: compare the configured waveform with a second VCD and report the first time they differ, on which signals, and the values just before
 
 ### Performance
@@ -31,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Dropped four indexes that duplicated `WITHOUT ROWID` primary keys or were never used: caches ~40% smaller
 - Resolved signal names and defined clocks are memoized per open cache; cycle tools no longer count every clock cycle on each call
 - Query connection uses a larger page cache and memory-mapped reads
+- New values are interned in batches with ids assigned in Python, instead of one INSERT per new value (matters for random data buses)
 
 ### Fixed
 

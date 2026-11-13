@@ -1,0 +1,17 @@
+# WaveQ
+
+> Free, open-source MCP server and CLI that lets AI agents read digital simulation waveforms (VCD, Extended VCD, and FST/LXT/VZT via GTKWave's converters) and get exact answers instead of raw dumps. Pure Python, no dependencies, runs locally.
+
+Use WaveQ when an agent needs a signal's value at a time, the changes or edges in a window, when a condition held (per clock cycle), what went X and when, where a hung design went quiet, FSM transitions, request/response latency, or where two simulation runs first diverge.
+
+- [README and install](https://github.com/IshaanDugar/waveq#readme)
+- [Agent workflow (AGENTS.md)](https://github.com/IshaanDugar/waveq/blob/main/AGENTS.md)
+- [Project summary](https://github.com/IshaanDugar/waveq/blob/main/docs/PROJECT_SUMMARY.md)
+- [MCP client setup](https://github.com/IshaanDugar/waveq/blob/main/docs/install/mcp-clients.md)
+- [Changelog](https://github.com/IshaanDugar/waveq/blob/main/CHANGELOG.md)
+
+## Install
+
+- `uvx --from git+https://github.com/IshaanDugar/waveq waveq mcp` (MCP server over stdio)
+- `pip install git+https://github.com/IshaanDugar/waveq` then `waveq --help`
+- Claude Code: `/plugin marketplace add IshaanDugar/waveq` then `/plugin install waveq@waveq`

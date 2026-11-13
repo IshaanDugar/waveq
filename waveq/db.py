@@ -12,6 +12,7 @@ import sys
 import time
 
 from . import __version__
+from .formats import is_native
 from .timeparse import Timescale
 
 # v3: same-value re-dumps are no longer stored as changes; header parsing is token-based.
@@ -19,7 +20,10 @@ _SCHEMA_VERSION = 3
 _UNIT_RE = re.compile(r"\b(1|10|100)\s*(fs|ps|ns|us|ms|s)\b", re.IGNORECASE)
 _INDEX_LEVELS = ("metadata", "changes", "runs", "edges")
 # Body directives whose contents are ordinary value changes; their closing $end is a no-op.
-_DUMP_BLOCKS = frozenset({"$dumpvars", "$dumpall", "$dumpon", "$dumpoff", "$end"})
+_DUMP_BLOCKS = frozenset({"$dumpvars", "$dumpall", "$dumpon", "$dumpoff", "$dumpports", "$dumpportsall", "$dumpportson", "$dumpportsoff", "$end"})
+
+# IEEE 1364 extended VCD port states -> 4-state values (driven or sensed, any strength).
+_EVCD_STATE = {**dict.fromkeys("DdLl0", "0"), **dict.fromkeys("UuHh1", "1"), **dict.fromkeys("ZTFf", "z")}
 
 EDGE_KINDS = ("rise", "fall", "x_enter", "x_exit", "z_enter", "z_exit", "scalar_change", "vector_change")
 CLOCK_EDGE_KINDS = ("rise", "fall")
@@ -288,7 +292,12 @@ def _parse_var(args: list[str], stack: list[str], signal_id: int) -> SignalDef:
         raise ValueError(f"malformed $var directive: {text}")
     kind = args[0]
     try:
-        width = int(args[1])
+        if args[1].startswith("["):
+            # Extended VCD ports declare a range instead of a width: $var port [7:0] <0 data $end
+            msb, _, lsb = args[1].strip("[]").partition(":")
+            width = abs(int(msb) - int(lsb or msb)) + 1
+        else:
+            width = int(args[1])
     except ValueError as exc:
         raise ValueError(f"malformed $var width in: {text}") from exc
     id_code = args[2]
@@ -589,8 +598,8 @@ def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None =
     source = Path(vcd_path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
-    if not (source.name.endswith(".vcd") or source.name.endswith(".vcd.gz")):
-        raise ValueError("WaveQ expects a .vcd or .vcd.gz input")
+    if not is_native(source):
+        raise ValueError("WaveQ parses .vcd and .evcd (optionally .gz); open formats such as .fst are converted first by the engine")
 
     db_path = cache_path_for(source, cache_dir)
     status = cache_status(source, cache_dir)
@@ -691,8 +700,8 @@ def build_database(
     source = Path(vcd_path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(source)
-    if not (source.name.endswith(".vcd") or source.name.endswith(".vcd.gz")):
-        raise ValueError("WaveQ expects a .vcd or .vcd.gz input")
+    if not is_native(source):
+        raise ValueError("WaveQ parses .vcd and .evcd (optionally .gz); open formats such as .fst are converted first by the engine")
 
     db_path = cache_path_for(source, cache_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -764,19 +773,17 @@ def build_database(
     edges_batch: list[tuple[int, int, int, int, str]] = []
     VALUE_BATCH = 10000
 
+    values_batch: list[tuple[int, str, int, int, str | None]] = []
+
     def value_id(raw: str) -> int:
         cached = value_ids.get(raw)
         if cached is not None:
             return cached
+        # The table starts empty and every value goes through this dict, so ids can be assigned
+        # here and inserted in batches instead of one INSERT per new value.
         has_x, has_z, int_value = _value_flags(raw)
-        cur = con.execute(
-            "INSERT OR IGNORE INTO values_interned(raw_value, has_x, has_z, int_value) VALUES(?, ?, ?, ?)",
-            (raw, has_x, has_z, int_value),
-        )
-        if cur.lastrowid:
-            vid = int(cur.lastrowid)
-        else:
-            vid = int(con.execute("SELECT value_id FROM values_interned WHERE raw_value=?", (raw,)).fetchone()[0])
+        vid = len(value_ids) + 1
+        values_batch.append((vid, raw, has_x, has_z, int_value))
         value_ids[raw] = vid
         value_xz[vid] = (has_x, has_z)
         return vid
@@ -803,7 +810,10 @@ def build_database(
     value_id("x")  # every signal starts as x before its first dump
 
     def flush_batches(force: bool = False) -> None:
-        nonlocal changes_batch, runs_batch, edges_batch
+        nonlocal changes_batch, runs_batch, edges_batch, values_batch
+        if values_batch and (force or len(values_batch) >= VALUE_BATCH):
+            con.executemany("INSERT INTO values_interned(value_id, raw_value, has_x, has_z, int_value) VALUES(?, ?, ?, ?, ?)", values_batch)
+            values_batch = []
         if changes_batch and (force or len(changes_batch) >= VALUE_BATCH):
             con.executemany("INSERT INTO changes(signal_id, tick, ordinal, value_id) VALUES(?, ?, ?, ?)", changes_batch)
             changes_batch = []
@@ -903,6 +913,16 @@ def build_database(
                 continue
             if first in "01xXzZ":
                 record_change(_canonical_scalar(first), line[1:].strip())
+                continue
+            if first == "p":
+                # Extended VCD port change: p<one state char per bit> <strength0> <strength1> <id>
+                parts = line.split()
+                if len(parts) >= 2:
+                    bits = "".join(_EVCD_STATE.get(ch, "x") for ch in parts[0][1:])
+                    if len(bits) == 1:
+                        record_change(bits, parts[-1])
+                    elif bits:
+                        record_change("b" + bits, parts[-1])
                 continue
             if first in "bBrRsS":
                 parts = line.split(maxsplit=1)

@@ -1075,6 +1075,76 @@ class SubsetIndexTests(unittest.TestCase):
         self.assertEqual(r["status"], "bad_signals")
 
 
+_EVCD = """$timescale 1 ns $end
+$scope module top $end
+$var port 1 <0 clk $end
+$var port [3:0] <1 data $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpports
+pD 6 0 <0
+pDDDD 6 0 <1
+$end
+#5
+pU 0 6 <0
+pLHZX 6 6 <1
+#10
+pD 6 0 <0
+pHHHH 6 6 <1
+"""
+
+
+class FormatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import os
+        self.tmp = make_tmp_dir()
+        self.engine = WaveQEngine()
+        self.saved = os.environ.pop("WAVEQ_FST2VCD", None)
+
+    def tearDown(self) -> None:
+        import os
+        self.engine.close()
+        if self.saved is not None:
+            os.environ["WAVEQ_FST2VCD"] = self.saved
+        else:
+            os.environ.pop("WAVEQ_FST2VCD", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_extended_vcd_ports(self) -> None:
+        vcd = write_text(self.tmp / "dut.evcd", _EVCD)
+        r = self.engine.configure(str(vcd), cache_dir=str(self.tmp / "cache"), rebuild=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.engine.value_at("top.clk", 5)["data"]["value"], "1")
+        self.assertEqual(self.engine.value_at("top.data", 5)["data"]["value"], "b01zx")
+        self.assertEqual(self.engine.value_at("top.data", 10)["data"]["hex"], "0xf")
+        self.assertEqual([e["kind"] for e in self.engine.edges("top.clk")["data"]["edges"]], ["x_exit", "rise", "fall"])
+
+    def test_fst_goes_through_converter_and_is_reused(self) -> None:
+        import os, sys
+        fake = write_text(self.tmp / "fake_fst2vcd.py", "import sys\nsys.stdout.write(open(" + repr(str(FIXTURES / "sample.vcd")) + ").read())\n")
+        fst = write_text(self.tmp / "wave.fst", "not really fst")
+        os.environ["WAVEQ_FST2VCD"] = f'"{sys.executable}" "{fake}"'
+        r = self.engine.configure(str(fst), cache_dir=str(self.tmp / "cache"), rebuild=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["converter"], "fst2vcd")
+        self.assertEqual(r["data"]["conversion"], "converted")
+        self.assertEqual(self.engine.value_at("tb.valid", 16)["data"]["value"], "1")
+        again = self.engine.configure(str(fst), cache_dir=str(self.tmp / "cache"))
+        self.assertEqual(again["data"]["conversion"], "reused")
+
+    def test_unconvertible_formats_explain_themselves(self) -> None:
+        import shutil as sh
+        for name, needle in (("a.ghw", "--vcd="), ("a.fsdb", "fsdb2vcd"), ("a.xyz", "unsupported format")):
+            r = self.engine.configure(str(write_text(self.tmp / name, "x")), cache_dir=str(self.tmp / "cache"))
+            self.assertFalse(r["ok"])
+            self.assertIn(needle, r["summary"])
+        if sh.which("fst2vcd") is None:
+            r = self.engine.configure(str(write_text(self.tmp / "b.fst", "x")), cache_dir=str(self.tmp / "cache"))
+            self.assertFalse(r["ok"])
+            self.assertIn("GTKWave", r["summary"])
+
+
 class MCPTests(unittest.TestCase):
     def call_tool(self, name: str, arguments: dict[str, object], msg_id: int = 100) -> dict[str, object]:
         resp = handle_message({"jsonrpc": "2.0", "id": msg_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})

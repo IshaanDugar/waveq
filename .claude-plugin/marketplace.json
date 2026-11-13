@@ -1,0 +1,16 @@
+{
+  "name": "waveq",
+  "description": "WaveQ: open-source waveform (VCD/FST) debugging tools for AI agents",
+  "owner": {
+    "name": "Ishaan Dugar",
+    "url": "https://github.com/IshaanDugar"
+  },
+  "plugins": [
+    {
+      "name": "waveq",
+      "source": "./",
+      "description": "Exact answers from VCD/FST simulation waveforms for AI agents: values, edges, cycles, X origins, hangs.",
+      "version": "3.1.0"
+    }
+  ]
+}

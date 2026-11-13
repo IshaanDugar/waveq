@@ -19,6 +19,8 @@ from .db import (
     rebuild_clock_edges,
     size_class_for_bytes,
 )
+from .db import default_cache_dir_for
+from .formats import prepare_source
 from .timeparse import Timescale, parse_radius_to_ticks, parse_time_to_ticks
 
 
@@ -207,6 +209,7 @@ class WaveQEngine:
         try:
             if index not in CONFIGURE_INDEX_MODES:
                 return fail("bad_index_mode", f"index must be one of: {', '.join(CONFIGURE_INDEX_MODES)}", {"allowed": list(CONFIGURE_INDEX_MODES)})
+            vcd_path, converted = self._prepare(vcd_path, cache_dir)
             source = Path(vcd_path).expanduser().resolve()
             size_class = size_class_for_bytes(source.stat().st_size)
             prior = cache_status(source, cache_dir)
@@ -248,6 +251,8 @@ class WaveQEngine:
             data["query_ready"] = self._query_ready()
             data["index_levels_ready"] = self._ready_levels()
             data["cache_reused"] = stats.reused
+            if converted:
+                data.update(converted)
             data["recommended_next_tool"] = None if data["query_ready"] else "build_index"
             data["recommended_build_level"] = None if data["query_ready"] else "full"
             summary = (
@@ -259,8 +264,17 @@ class WaveQEngine:
         except Exception as exc:
             return fail("configure_failed", str(exc))
 
+    @staticmethod
+    def _prepare(path: str, cache_dir: str | None) -> tuple[str, dict[str, str] | None]:
+        """Native files pass through; .fst/.lxt/.lxt2/.vzt are converted to VCD in the cache directory."""
+        root = Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir_for(path)
+        out, info = prepare_source(path, root)
+        return str(out), info
+
     def index_status(self, vcd_path: str | None = None, cache_dir: str | None = None) -> dict[str, Any]:
         try:
+            if vcd_path:
+                vcd_path = self._prepare(vcd_path, cache_dir if cache_dir is not None else self.cache_dir)[0]
             target = Path(vcd_path).expanduser().resolve() if vcd_path else self.vcd_path
             if target is None:
                 return fail("not_configured", "no waveform configured and no vcd_path supplied")
@@ -272,6 +286,8 @@ class WaveQEngine:
     def build_index(self, vcd_path: str | None = None, cache_dir: str | None = None, level: str = "full", signals: list[str] | None = None, rebuild: bool = False) -> dict[str, Any]:
         started = time.perf_counter()
         try:
+            if vcd_path:
+                vcd_path = str(self._prepare(vcd_path, cache_dir if cache_dir is not None else self.cache_dir)[0])
             target = str(Path(vcd_path).expanduser().resolve()) if vcd_path else (str(self.vcd_path) if self.vcd_path else None)
             use_cache_dir = cache_dir if cache_dir is not None else self.cache_dir
             if target is None:
@@ -1795,6 +1811,7 @@ class WaveQEngine:
             if need:
                 return need
             limit = max(1, min(int(limit), 10000))
+            other_vcd = str(self._prepare(other_vcd, other_cache_dir or self.cache_dir)[0])
             stats = build_database(other_vcd, other_cache_dir or self.cache_dir, level="full")
             other = connect(stats.db_path, readonly=True)
             meta_b = {r["key"]: r["value"] for r in other.execute("SELECT key, value FROM meta")}

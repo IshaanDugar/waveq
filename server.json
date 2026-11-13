@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.IshaanDugar/waveq",
+  "title": "WaveQ",
+  "description": "Exact answers from VCD/FST simulation waveforms for AI agents, over a local index.",
+  "repository": {
+    "url": "https://github.com/IshaanDugar/waveq",
+    "source": "github"
+  },
+  "websiteUrl": "https://ishaandugar.github.io/waveq/",
+  "version": "3.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "waveq",
+      "version": "3.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

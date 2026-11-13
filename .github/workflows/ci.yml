@@ -32,3 +32,6 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+      - name: Ground-truth check on a generated SoC-style dump
+        run: python benchmarks/realistic_vcd.py --cycles 5000 --filler 8
