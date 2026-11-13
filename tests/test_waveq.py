@@ -843,6 +843,133 @@ class CacheLocationTests(unittest.TestCase):
         self.assertEqual(default_cache_dir_for(synced / "a.vcd"), (self.tmp / "explicit").resolve())
 
 
+def divergence_vcd(path: pathlib.Path, *, unit: str = "ns", a_fall: int = 30, d_change: int | None = None, extra_var: str = "only_a") -> pathlib.Path:
+    """Run with a 1-bit `a` (rises at 10, falls at a_fall), an 8-bit `d` (5 at 20, optionally changes at d_change), and one run-specific signal."""
+    lines = [
+        f"$timescale 1 {unit} $end",
+        "$scope module tb $end",
+        "$var wire 1 ! a $end",
+        "$var wire 8 \" d [7:0] $end",
+        f"$var wire 1 # {extra_var} $end",
+        "$upscope $end",
+        "$enddefinitions $end",
+        "$dumpvars", "0!", "b00000000 \"", "0#", "$end",
+        "#10", "1!",
+        "#20", "b00000101 \"",
+    ]
+    events = {a_fall: "0!"}
+    if d_change is not None:
+        events[d_change] = "b00000110 \""
+    for tick in sorted(events):
+        lines += [f"#{tick}", events[tick]]
+    lines += ["#40", ""]
+    return write_text(path, "\n".join(lines))
+
+
+class FirstDivergenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = make_tmp_dir()
+        self.cache = str(self.tmp / "cache")
+        # B differs from A: d is 6 from 25 (A keeps 5), and a falls at 35 instead of 30.
+        self.a = divergence_vcd(self.tmp / "a.vcd", a_fall=30, extra_var="only_a")
+        self.b = divergence_vcd(self.tmp / "b.vcd", a_fall=35, d_change=25, extra_var="only_b")
+        self.engine = WaveQEngine()
+        result = self.engine.configure(str(self.a), cache_dir=self.cache, rebuild=True)
+        self.assertTrue(result["ok"], result)
+
+    def tearDown(self) -> None:
+        self.engine.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def diverge(self, **kwargs: object) -> dict[str, object]:
+        return self.engine.first_divergence(str(self.b), other_cache_dir=self.cache, **kwargs)
+
+    def test_first_divergence_orders_by_tick_and_reports_values(self) -> None:
+        r = self.diverge()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["status"], "ok")
+        data = r["data"]
+        self.assertEqual(data["first_divergence_tick"], 25)
+        self.assertEqual(data["first_divergence_time"], "25ns")
+        self.assertEqual(data["compared_count"], 2)
+        self.assertEqual(data["diverged_count"], 2)
+        self.assertEqual([(s["signal"], s["tick"]) for s in data["signals"]], [("tb.d [7:0]", 25), ("tb.a", 30)])
+        self.assertEqual((data["signals"][0]["value_a"], data["signals"][0]["value_b"]), ("0x05", "0x06"))
+        self.assertEqual((data["signals"][1]["value_a"], data["signals"][1]["value_b"]), ("0", "1"))
+        self.assertEqual(data["context"]["tick"], 24)
+        self.assertEqual(data["context"]["values"][0], {"signal": "tb.d [7:0]", "value_a": "0x05", "value_b": "0x05"})
+        self.assertFalse(data["truncated"])
+
+    def test_signals_only_in_one_run_are_counted_not_compared(self) -> None:
+        data = self.diverge()["data"]
+        self.assertEqual(data["only_in_a"], ["tb.only_a"])
+        self.assertEqual(data["only_in_b"], ["tb.only_b"])
+        self.assertEqual((data["only_in_a_count"], data["only_in_b_count"]), (1, 1))
+
+    def test_identical_runs_report_no_match(self) -> None:
+        same = divergence_vcd(self.tmp / "same.vcd", a_fall=30, extra_var="only_a")
+        r = self.engine.first_divergence(str(same), other_cache_dir=self.cache)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["status"], "no_match")
+        self.assertIsNone(r["data"]["first_divergence_tick"])
+        self.assertEqual(r["data"]["diverged_count"], 0)
+        self.assertEqual(r["data"]["compared_count"], 3)
+
+    def test_timescale_mismatch_fails_with_both_timescales(self) -> None:
+        other = divergence_vcd(self.tmp / "ps.vcd", unit="ps")
+        r = self.engine.first_divergence(str(other), other_cache_dir=self.cache)
+        self.assertFalse(r["ok"], r)
+        self.assertEqual(r["status"], "timescale_mismatch")
+        self.assertEqual((r["data"]["timescale_a"], r["data"]["timescale_b"]), ("1ns", "1ps"))
+
+    def test_window_start_inside_held_difference_diverges_at_start(self) -> None:
+        data = self.diverge(start="27ns")["data"]
+        self.assertEqual([(s["signal"], s["tick"]) for s in data["signals"]], [("tb.d [7:0]", 27), ("tb.a", 30)])
+        data = self.diverge(start="32ns")["data"]
+        self.assertEqual([(s["signal"], s["tick"]) for s in data["signals"]], [("tb.a", 32), ("tb.d [7:0]", 32)])
+        data = self.diverge(start="36ns")["data"]
+        self.assertEqual([(s["signal"], s["tick"]) for s in data["signals"]], [("tb.d [7:0]", 36)])
+
+    def test_window_end_before_difference_is_no_match(self) -> None:
+        r = self.diverge(end="24ns")
+        self.assertEqual(r["status"], "no_match", r)
+
+    def test_signal_and_scope_selection(self) -> None:
+        r = self.diverge(signals=["tb.a"])
+        self.assertEqual([(s["signal"], s["tick"]) for s in r["data"]["signals"]], [("tb.a", 30)])
+        self.assertEqual(r["data"]["compared_count"], 1)
+        r = self.diverge(scope="tb")
+        self.assertEqual(r["data"]["diverged_count"], 2)
+
+    def test_bad_inputs_fail(self) -> None:
+        missing = self.diverge(signals=["tb.only_a"])
+        self.assertFalse(missing["ok"], missing)
+        self.assertEqual(missing["data"]["errors"][0]["status"], "not_in_other_run")
+        self.assertFalse(self.diverge(signals=["tb.nope"])["ok"])
+        self.assertFalse(self.diverge(start="50ns")["ok"])
+        self.assertEqual(self.diverge(start="30ns", end="20ns")["status"], "bad_range")
+        self.assertFalse(self.engine.first_divergence(str(self.tmp / "missing.vcd"), other_cache_dir=self.cache)["ok"])
+
+    def test_limit_truncates(self) -> None:
+        data = self.diverge(limit=1)["data"]
+        self.assertEqual(len(data["signals"]), 1)
+        self.assertTrue(data["truncated"])
+        self.assertEqual(data["diverged_count"], 2)
+
+    def test_mcp_first_divergence_smoke(self) -> None:
+        def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+            resp = handle_message({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+            self.assertIsNotNone(resp)
+            return resp["result"]
+
+        self.assertFalse(call("configure_waveform", {"vcd_path": str(self.a), "cache_dir": self.cache})["isError"])
+        r = call("first_divergence", {"other_vcd_path": str(self.b), "other_cache_dir": self.cache})
+        self.assertFalse(r["isError"], r)
+        self.assertEqual(r["structuredContent"]["data"]["first_divergence_tick"], 25)
+        bad = call("first_divergence", {"other_vcd_path": str(self.tmp / "missing.vcd")})
+        self.assertTrue(bad["isError"], bad)
+
+
 class MCPTests(unittest.TestCase):
     def call_tool(self, name: str, arguments: dict[str, object], msg_id: int = 100) -> dict[str, object]:
         resp = handle_message({"jsonrpc": "2.0", "id": msg_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})

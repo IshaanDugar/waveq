@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("activity", help="Last change per signal and idle signals in a window"); add_common(sp); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--scope"); sp.add_argument("--ignore", nargs="*"); sp.add_argument("--limit", type=int, default=50)
     sp = sub.add_parser("transitions", help="FSM transition counts and time per value"); add_common(sp); sp.add_argument("signal"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=50)
     sp = sub.add_parser("pair", help="Pair request/response cycles and report latency and unmatched requests"); add_common(sp); sp.add_argument("--clock", required=True); sp.add_argument("--request", nargs="+", type=parse_condition, required=True, metavar="SIGNAL==VALUE"); sp.add_argument("--response", nargs="+", type=parse_condition, required=True, metavar="SIGNAL==VALUE"); sp.add_argument("--edge", choices=["rise", "fall"], default="rise"); sp.add_argument("--sample", choices=FIND_SAMPLES, default="before"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--request-id"); sp.add_argument("--response-id"); sp.add_argument("--allow-same-cycle", action="store_true"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("diff", help="Find where two VCD runs first differ"); add_common(sp); sp.add_argument("other", help="Second .vcd or .vcd.gz to compare against"); sp.add_argument("--signals", nargs="*"); sp.add_argument("--scope"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=20); sp.add_argument("--other-cache-dir", default=None, help="Optional cache directory for the second VCD")
     sub.add_parser("mcp", help="Run the MCP stdio server")
 
     args = p.parse_args(argv)
@@ -107,6 +108,14 @@ def main(argv: list[str] | None = None) -> int:
         result = eng.define_clock(args.clock, args.edge)
         if result.get("ok"):
             result = eng.pair_events(args.clock, args.request, args.response, args.edge, args.sample, args.start, args.end, args.request_id, args.response_id, args.allow_same_cycle, args.limit)
+    elif args.cmd == "diff":
+        result = None
+        if eng.meta.get("ready_runs") != "1":
+            built = eng.build_index(args.vcd, args.cache_dir, "full")
+            if not built.get("ok"):
+                result = built
+        if result is None:
+            result = eng.first_divergence(args.other, args.signals, args.scope, args.start, args.end, args.other_cache_dir, args.limit)
     else: raise AssertionError(args.cmd)
     print_json(result)
     return 0 if result.get("ok") else 1

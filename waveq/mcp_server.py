@@ -17,6 +17,7 @@ SERVER_INSTRUCTIONS = (
     "Add payload=[...] to find_times to get each match's data in the same call. "
     "For debugging: list_scopes to browse the hierarchy, x_report for where an X came from, activity for where a hung design went quiet, "
     "state_transitions for FSM behaviour, pair_events for request/response latency and requests that never completed. "
+    "Use first_divergence to compare the configured waveform with a second VCD (passing vs failing run) and find where they first differ. "
     "Use define_clock before cycle-based queries. WaveQ reports observed waveform facts; it does not prove protocol correctness unless a tool explicitly checks a rule."
 )
 
@@ -220,6 +221,46 @@ TOOLS: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str,
             a["clock"], list(a["request"]), list(a["response"]), a.get("edge", "rise"), a.get("sample", "before"), a.get("start"), a.get("end"),
             a.get("request_id"), a.get("response_id"), bool(a.get("allow_same_cycle", False)), int(a.get("limit", 100)),
         ),
+    ),
+    "first_divergence": (
+        "Compare the configured waveform (run A) with a second VCD (run B) and report the earliest time they differ and on which signals "
+        "(e.g. passing vs failing seed, or two RTL revisions). Signals match by exact full path; both runs need the same timescale. "
+        "No difference is ok with status no_match.",
+        _schema({
+            "other_vcd_path": _str("Path to the second .vcd or .vcd.gz"),
+            "signals": _arr("Optional signals to compare (full paths or unique leaf names in run A)"),
+            "scope": _str("Optional scope filter"),
+            "start": _str("Optional window start"),
+            "end": _str("Optional window end"),
+            "other_cache_dir": _str("Optional cache directory for the second VCD; defaults to the first one's"),
+            "limit": _int("Max diverging signals listed", 20),
+        }, ["other_vcd_path"]),
+        lambda a: ENGINE.first_divergence(a["other_vcd_path"], a.get("signals"), a.get("scope"), a.get("start"), a.get("end"), a.get("other_cache_dir"), int(a.get("limit", 20))),
+    ),
+    "define_clock": (
+        "Build a cycle index from one signal's edge events. Call before cycle-based tools.",
+        _schema({"signal": _str("Clock signal"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["signal"]),
+        lambda a: ENGINE.define_clock(a["signal"], a.get("edge", "rise")),
+    ),
+    "time_to_cycle": (
+        "Map a time to the latest clock cycle at or before that time.",
+        _schema({"clock": _str("Clock signal"), "time": _str("Query time"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["clock", "time"]),
+        lambda a: ENGINE.time_to_cycle(a["clock"], a["time"], a.get("edge", "rise")),
+    ),
+    "cycle_to_time": (
+        "Map a clock cycle index to its VCD time.",
+        _schema({"clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["clock", "cycle_index"]),
+        lambda a: ENGINE.cycle_to_time(a["clock"], int(a["cycle_index"]), a.get("edge", "rise")),
+    ),
+    "values_at_cycle": (
+        "Batch values_at for several signals at a clock cycle.",
+        _schema({"signals": _arr("Signal full paths or unique leaf names"), "clock": _str("Clock signal"), "cycle_index": _int("Cycle index"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS)}, ["signals", "clock", "cycle_index"]),
+        lambda a: ENGINE.values_at_cycle(list(a["signals"]), a["clock"], int(a["cycle_index"]), a.get("edge", "rise")),
+    ),
+    "changes_by_cycle": (
+        "Return one signal's changes between two clock cycle indices.",
+        _schema({"signal": _str("Signal full path or unique leaf"), "clock": _str("Clock signal"), "start_cycle": _int("Start cycle"), "end_cycle": _int("End cycle"), "edge": _enum("Clock edge; default rise", CLOCK_EDGE_KINDS), "limit": _int("Max rows", 200)}, ["signal", "clock", "start_cycle", "end_cycle"]),
+        lambda a: ENGINE.changes_by_cycle(a["signal"], a["clock"], int(a["start_cycle"]), int(a["end_cycle"]), a.get("edge", "rise"), int(a.get("limit", 200))),
     ),
 }
 

@@ -1735,3 +1735,223 @@ class WaveQEngine:
             return ok("ok", summary, data, limitations=limitations)
         except Exception as exc:
             return fail("pair_events_failed", str(exc))
+
+    def first_divergence(
+        self,
+        other_vcd: str,
+        signals: list[str] | None = None,
+        scope: str | None = None,
+        start: str | int | None = None,
+        end: str | int | None = None,
+        other_cache_dir: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Compare this waveform (run A) with another VCD (run B) and report where they first differ."""
+        other: sqlite3.Connection | None = None
+        try:
+            need = self._index_required("runs")
+            if need:
+                return need
+            limit = max(1, min(int(limit), 10000))
+            stats = build_database(other_vcd, other_cache_dir or self.cache_dir, level="full")
+            other = connect(stats.db_path, readonly=True)
+            meta_b = {r["key"]: r["value"] for r in other.execute("SELECT key, value FROM meta")}
+            ts_a = self._timescale()
+            ts_b = Timescale(int(meta_b["timescale_number"]), meta_b["timescale_unit"])
+            if ts_a != ts_b:
+                return fail(
+                    "timescale_mismatch",
+                    f"timescales differ: {ts_a.number}{ts_a.unit} vs {ts_b.number}{ts_b.unit}; WaveQ does not convert between them",
+                    {"timescale_a": f"{ts_a.number}{ts_a.unit}", "timescale_b": f"{ts_b.number}{ts_b.unit}"},
+                )
+            max_a = int(self.meta.get("max_tick", 0))
+            max_b = int(meta_b.get("max_tick", 0))
+            common_max = min(max_a, max_b)
+            a = self.parse_tick(start) if start is not None else 0
+            b = self.parse_tick(end) if end is not None else common_max
+            if b < a:
+                return fail("bad_range", "end must be >= start")
+            if a < 0 or b > common_max:
+                return fail(
+                    "time_out_of_range",
+                    f"window {self.format_tick(a)}..{self.format_tick(b)} is outside the common range 0..{self.format_tick(common_max)}",
+                    {"start_tick": a, "end_tick": b, "min_tick": 0, "max_tick": common_max},
+                )
+
+            # Select signals in A, then find the same full paths in B.
+            if signals:
+                chosen: list[SignalRef] = []
+                errors = []
+                for name in signals:
+                    sig = self.get_signal(name)
+                    if isinstance(sig, dict):
+                        errors.append({"signal": name, "status": sig.get("status"), "summary": sig.get("summary"), "data": sig.get("data")})
+                    else:
+                        chosen.append(sig)
+                chosen = list({s.signal_id: s for s in chosen}.values())
+                rows_b = {r["full_path"]: r for r in other.execute("SELECT * FROM signals")}
+                for sig in chosen:
+                    if sig.full_path not in rows_b:
+                        errors.append({"signal": sig.full_path, "status": "not_in_other_run", "summary": f"{sig.full_path} is not present in {other_vcd}"})
+                if errors:
+                    return fail("partial_failure", "One or more signal lookups failed", {"errors": errors})
+                sel_a = chosen
+                paths_b = {s.full_path for s in chosen}
+            elif scope:
+                scoped = self._signals_in_scope(scope)
+                if isinstance(scoped, dict):
+                    return scoped
+                sel_a = scoped
+                rows_b = {r["full_path"]: r for r in other.execute("SELECT * FROM signals") if self._scope_matches(r["scope"], scope)}
+                paths_b = set(rows_b)
+            else:
+                sel_a = [SignalRef.from_row(r) for r in self.require().execute("SELECT * FROM signals ORDER BY full_path")]
+                rows_b = {r["full_path"]: r for r in other.execute("SELECT * FROM signals")}
+                paths_b = set(rows_b)
+            paths_a = {s.full_path for s in sel_a}
+            only_a = sorted(paths_a - paths_b)
+            only_b = sorted(paths_b - paths_a)
+            common: list[tuple[SignalRef, int]] = []
+            width_mismatch: list[str] = []
+            for sig in sel_a:
+                row_b = rows_b.get(sig.full_path)
+                if row_b is None:
+                    continue
+                if int(row_b["width"]) != sig.width:
+                    width_mismatch.append(sig.full_path)
+                    continue
+                common.append((sig, int(row_b["signal_id"])))
+            if not common:
+                return fail(
+                    "no_common_signals",
+                    "No signals with the same full path and width exist in both runs",
+                    {"only_in_a_count": len(only_a), "only_in_b_count": len(only_b), "only_in_a": only_a[:20], "only_in_b": only_b[:20]},
+                )
+
+            found: list[tuple[int, SignalRef, int, sqlite3.Row, sqlite3.Row]] = []
+            for sig, sid_b in common:
+                hit = self._first_run_difference(self.require(), sig.signal_id, other, sid_b, a, b)
+                if hit is not None:
+                    found.append((hit[0], sig, sid_b, hit[1], hit[2]))
+            found.sort(key=lambda item: (item[0], item[1].full_path))
+
+            def shown(row: sqlite3.Row, width: int) -> str:
+                return display_value(row, width)
+
+            entries = [
+                {"signal": sig.full_path, "tick": tick, "time": self.format_tick(tick), "value_a": shown(ra, sig.width), "value_b": shown(rb, sig.width)}
+                for tick, sig, _sid_b, ra, rb in found[:limit]
+            ]
+            data: dict[str, Any] = {
+                "other_vcd": str(Path(other_vcd).expanduser().resolve()),
+                "start_tick": a,
+                "end_tick": b,
+                "start_time": self.format_tick(a),
+                "end_time": self.format_tick(b),
+                "compared_count": len(common),
+                "diverged_count": len(found),
+                "first_divergence_tick": found[0][0] if found else None,
+                "first_divergence_time": self.format_tick(found[0][0]) if found else None,
+                "signals": entries,
+                "truncated": len(found) > limit,
+                "only_in_a_count": len(only_a),
+                "only_in_b_count": len(only_b),
+                "only_in_a": only_a[:20],
+                "only_in_b": only_b[:20],
+                "width_mismatch": width_mismatch[:20],
+                "context": None,
+            }
+            limitations: list[str] = []
+            if max_a != max_b:
+                longer = "A" if max_a > max_b else "B"
+                limitations.append(f"run {longer} is longer (A ends at {self.format_tick(max_a)}, B at {self.format_tick(max_b)}); only the common range was compared")
+            if only_a or only_b:
+                limitations.append(f"{len(only_a)} signal(s) only in A and {len(only_b)} only in B were not compared")
+            if width_mismatch:
+                limitations.append(f"{len(width_mismatch)} signal(s) have different widths in the two runs and were not compared")
+            if data["truncated"]:
+                limitations.append("signal list truncated at limit")
+            if not found:
+                return ok(
+                    "no_match",
+                    f"No divergence across {len(common)} common signal(s) between {self.format_tick(a)} and {self.format_tick(b)}",
+                    data,
+                    limitations=limitations,
+                )
+            first_tick = found[0][0]
+            if first_tick > 0:
+                before = first_tick - 1
+                ctx = []
+                for _tick, sig, sid_b, _ra, _rb in found[: min(limit, 10)]:
+                    ra = self._held_row_in(self.require(), sig.signal_id, before)
+                    rb = self._held_row_in(other, sid_b, before)
+                    ctx.append({
+                        "signal": sig.full_path,
+                        "value_a": shown(ra, sig.width) if ra else None,
+                        "value_b": shown(rb, sig.width) if rb else None,
+                    })
+                data["context"] = {"tick": before, "time": self.format_tick(before), "values": ctx}
+            top = entries[0]
+            summary = (
+                f"First divergence at {top['time']} on {top['signal']} (A={top['value_a']}, B={top['value_b']}); "
+                f"{len(found)} of {len(common)} compared signal(s) diverge by {self.format_tick(b)}"
+            )
+            return ok("ok", summary, data, limitations=limitations)
+        except Exception as exc:
+            return fail("first_divergence_failed", str(exc))
+        finally:
+            if other is not None:
+                other.close()
+
+    @staticmethod
+    def _held_row_in(con: sqlite3.Connection, signal_id: int, tick: int) -> sqlite3.Row | None:
+        return con.execute(
+            """
+            SELECT v.raw_value, v.int_value FROM signal_runs r JOIN values_interned v ON v.value_id=r.value_id
+            WHERE r.signal_id=? AND r.start_tick<=? AND r.end_tick>? ORDER BY r.start_tick DESC LIMIT 1
+            """,
+            (signal_id, tick, tick),
+        ).fetchone()
+
+    @staticmethod
+    def _first_run_difference(
+        con_a: sqlite3.Connection, sid_a: int, con_b: sqlite3.Connection, sid_b: int, a: int, b: int
+    ) -> tuple[int, sqlite3.Row, sqlite3.Row] | None:
+        """Walk both runs tables in tandem over [a, b]; return (tick, row_a, row_b) at the first differing value."""
+
+        def cursor(con: sqlite3.Connection, sid: int) -> sqlite3.Cursor:
+            first = con.execute(
+                "SELECT start_tick FROM signal_runs WHERE signal_id=? AND start_tick<=? ORDER BY start_tick DESC LIMIT 1", (sid, a)
+            ).fetchone()
+            lo = int(first[0]) if first else a
+            return con.execute(
+                """
+                SELECT r.end_tick, v.raw_value, v.int_value
+                FROM signal_runs r JOIN values_interned v ON v.value_id=r.value_id
+                WHERE r.signal_id=? AND r.start_tick BETWEEN ? AND ? ORDER BY r.start_tick
+                """,
+                (sid, lo, b),
+            )
+
+        def key(row: sqlite3.Row) -> str:
+            # Vectors may be written with different left-padding; the decimal value is the same.
+            return row["int_value"] if row["int_value"] is not None else row["raw_value"]
+
+        cur_a, cur_b = cursor(con_a, sid_a), cursor(con_b, sid_b)
+        row_a, row_b = cur_a.fetchone(), cur_b.fetchone()
+        if row_a is None or row_b is None:
+            raise RuntimeError("signal run data does not cover the requested window")
+        t = a
+        while True:
+            if key(row_a) != key(row_b):
+                return t, row_a, row_b
+            end_a, end_b = int(row_a["end_tick"]), int(row_b["end_tick"])
+            t = min(end_a, end_b)
+            if t > b:
+                return None
+            if end_a == t:
+                row_a = cur_a.fetchone()
+            if end_b == t:
+                row_b = cur_b.fetchone()
+            if row_a is None or row_b is None:
+                raise RuntimeError("signal run data ended before the requested window")

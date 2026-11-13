@@ -98,7 +98,7 @@ Recommended agent workflow:
 
 1. `configure_waveform` (with `index="full"` if you will query it) → 2. `list_scopes` / `resolve_signals` → 3. `define_clock` (for cycles) → 4. `window_digest` near the failure → 5. follow up with `values_at`, `changes_many`, `edges`, or `find_times` for "when did X happen?"
 
-### MCP tools (24)
+### MCP tools (25)
 
 | Tool | Purpose |
 |------|---------|
@@ -113,6 +113,7 @@ Recommended agent workflow:
 | `stable_between` | Held-value check over a range |
 | `window_digest` | Compact "what changed here?" summary |
 | `find_times` | When/whether conditions held: time intervals, or clock cycles (sampled before the edge), optionally with each match's payload values |
+| `first_divergence` | Compare two VCD runs and report when and on which signals they first differ |
 | `define_clock` | Build cycle index from clock edges |
 | `time_to_cycle` / `cycle_to_time` | Time ↔ cycle conversion |
 | `values_at_cycle` / `changes_by_cycle` | Cycle-based queries (`sample="before"` matches `find_times`) |
@@ -197,6 +198,7 @@ waveq xreport <vcd> [--time 500ns] [--scope u_core]
 waveq activity <vcd> [--start 0ns] [--end 1us] [--scope u_core] [--ignore tb.clk]
 waveq transitions <vcd> tb.u_fsm.state
 waveq pair <vcd> --clock tb.clk --request "tb.arvalid==1" "tb.arready==1" --response "tb.rvalid==1" "tb.rready==1" "tb.rlast==1" [--request-id tb.arid --response-id tb.rid]
+waveq diff <vcd_a> <vcd_b> [--signals ...] [--scope S] [--start T] [--end T] [--limit N] [--other-cache-dir DIR]
 ```
 
 ## Development

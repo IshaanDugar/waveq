@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `value_at` / `values_at` results include a `hex` field for fully known vectors
 - `WAVEQ_CACHE_DIR` environment variable; the default cache moves to the per-user cache directory when the VCD's folder is synced (OneDrive, Dropbox, Google Drive, iCloud) or read-only
 - CLI commands `scopes`, `xreport`, `activity`, `transitions`, `pair`; `find --payload`; `--index` on every command that configures
+- `first_divergence` MCP tool and `waveq diff` CLI command: compare the configured waveform with a second VCD and report the first time they differ, on which signals, and the values just before
 
 ### Performance
 
