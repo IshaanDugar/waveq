@@ -1,10 +1,11 @@
 # WaveQ: project summary
 
-WaveQ lets an AI agent ask exact questions about a digital simulation waveform (a `.vcd` or `.vcd.gz` file) instead of reading the raw dump. It is a local MCP server and a CLI, written in pure Python with no runtime dependencies, licensed AGPL-3.0-or-later, by Ishaan Dugar.
+WaveQ lets an AI agent ask exact questions about a digital simulation waveform (VCD or Extended VCD, optionally gzipped; FST, LXT and VZT through GTKWave's open converters) instead of reading the raw dump. It is a local MCP server and a CLI, written in pure Python with no runtime dependencies, licensed AGPL-3.0-or-later, by Ishaan Dugar.
 
 - Repository: https://github.com/IshaanDugar/waveq
 - Site: https://ishaandugar.github.io/waveq/
-- Package version: 3.0.0 (the work below is in `[Unreleased]` in the changelog)
+- Package version: 3.1.0 (the work below is in `[Unreleased]` in the changelog until the first PyPI release)
+- Audience: students, learners, hobbyists and open-source hardware projects (cocotb, Verilator, Icarus, GHDL)
 
 ## The problem
 
@@ -19,6 +20,16 @@ WaveQ turns the dump into an indexed SQLite cache once, then answers questions w
 3. **Observations, not proofs.** WaveQ reports what the waveform shows. Tools that pair or summarise (for example `pair_events`) say what they assume in `limitations`. It is not a protocol checker.
 4. **Zero dependencies, local only.** The standard library only (`sqlite3`, `gzip`, `argparse`, `json`). Nothing leaves the machine.
 5. **Pay for what you query.** Small files index fully on configure; large files stay metadata-only until asked, and can index only the signals needed.
+
+## Input formats (`waveq/formats.py`)
+
+| Format | Support |
+|---|---|
+| VCD, `.vcd.gz` | native |
+| Extended VCD (`.evcd`, IEEE 1364 port dumps) | native: `$var port [msb:lsb]` declarations and `p` port changes, mapped to 0/1/x/z |
+| FST, LXT, LXT2, VZT | converted with GTKWave's `fst2vcd` / `lxt2vcd` / `vzt2vcd` when on PATH (or `WAVEQ_FST2VCD` etc.); the VCD is cached and reused until the source changes |
+| GHW (GHDL) | a pointer to GHDL's own `--vcd` / `--fst` flags |
+| Closed vendor formats | a one-line "dump VCD from the simulator" |
 
 ## How it works
 
@@ -97,28 +108,43 @@ Indexing 4 of 128 signals on the medium dump: 0.13 s and 1.3 MB, against 0.80 s 
 
 ## Quality
 
-- 72 unit tests (`python -m unittest discover -s tests`): parser regressions, exact time handling, strict failures, batch equivalence against single queries, brute-force cross-checks for `find_times` and `x_report`, subset rows equal to full-build rows, MCP round trips.
+- 75 unit tests (`python -m unittest discover -s tests`): parser regressions, exact time handling, strict failures, batch equivalence against single queries, brute-force cross-checks for `find_times` and `x_report`, subset rows equal to full-build rows, MCP round trips.
+- `benchmarks/realistic_vcd.py` generates an SoC-style dump with known answers (out-of-order AXI-style reads with one hung request, an FSM, an injected X, filler registers) and checks `pair_events`, `x_report`, `state_transitions`, `activity` and `first_divergence` against them. At 34 MB (200k cycles, 74 signals) every check passes: all 60,000 request/response pairs exact, the hung request found, the X origin and time exact. Full index 14.7 s, 4-signal subset 3.8 s, queries 0.6 to 44 ms. A small run is part of CI.
 - CI on GitHub Actions; the index build was checked row-for-row against the previous build on every fixture after the performance changes.
 
 ## The site (`site/`)
 
 A single static page published with GitHub Pages (`.github/workflows/pages.yml`), built with the Hallmark design skill in its Cobalt theme. The hero shows raw `sample.vcd` lines joined to the JSON answer they become, and a live waveform of the same dump: a cursor travels to 16 ns, the run of `valid` it lands in lights up, a readout says "valid is 1 from 15 to 40 ns", and the matching lines glow. Every diagram is drawn from `examples/sample.vcd` by WaveQ itself (`python site/build_diagrams.py`). Motion is one 9-second loop using transform and opacity only, with a pause control; it pauses off screen and shows a still frame with reduced motion or no script.
 
+## Distribution
+
+- **Claude Code:** `/plugin install waveq --marketplace IshaanDugar/waveq` installs the MCP server and a waveform-debugging skill (`.claude-plugin/`, `skills/waveq/`).
+- **Any MCP client:** `uvx --from git+https://github.com/IshaanDugar/waveq waveq mcp`.
+- **PyPI and the official MCP registry:** `server.json` and `.github/workflows/publish.yml` publish both when a GitHub release is created (PyPI trusted publishing, then the registry via GitHub OIDC). `glama.json` claims the Glama listing.
+- **Discovery:** the site carries an OpenGraph image, JSON-LD, `llms.txt`, `robots.txt` and a sitemap, and is verified in Google Search Console; the repo has 20 topics and the site as its homepage.
+
+## License
+
+GNU AGPL-3.0-or-later: free to use, study, change and share; anyone who distributes a modified version or runs one as a service for others must publish their source under the same terms. Contributions are accepted under the same license.
+
 ## Repository layout
 
 ```
-waveq/        engine.py (queries), db.py (parse, cache, build), mcp_server.py, cli.py, timeparse.py
+waveq/        engine.py (queries), db.py (parse, cache, build), formats.py, mcp_server.py, cli.py, timeparse.py
 tests/        test_waveq.py and fixtures/*.vcd
-benchmarks/   benchmark_waveq.py (generates synthetic dumps, writes reports/)
+benchmarks/   benchmark_waveq.py (speed), realistic_vcd.py (ground-truth checks)
 examples/     sample.vcd used by the docs, the site and the tests
-site/         index.html, site.css, tokens.css, base.css, build_diagrams.py
+site/         index.html, site.css, tokens.css, base.css, build_diagrams.py, og.png, llms.txt, sitemap.xml
 docs/         install guides (MCP clients, Codex on Windows) and this summary
 AGENTS.md     how an AI agent should use the tools
+.claude-plugin/, skills/   Claude Code plugin, marketplace and skill
+server.json, glama.json   MCP registry and Glama listing
 ```
 
 ## Limits and open work
 
-- **Formats:** VCD and VCD.GZ only; no FST, FSDB or VPD.
+- **Formats:** FST needs GTKWave's `fst2vcd` installed; a native FST reader would remove that step.
+- **Parse speed:** about 2.3 MB/s in pure Python (34 MB in 14.7 s); the parser is the bottleneck for large dumps.
 - **One pass over the whole file:** a one-off question on a huge dump still pays a full parse (a subset index cuts the storing, not the reading). A streaming no-SQLite mode for single questions is the next performance step.
 - **Conditions:** `==` and `!=` against whole signals, ANDed. No bit-selects (`data[7:4]`), ranges, ORs or temporal sequences yet.
 - **Time-window indexing** (index only around the failure) is not built.
