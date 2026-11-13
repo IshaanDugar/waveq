@@ -51,6 +51,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- License changed from MIT to GNU AGPL-3.0-or-later. Copies obtained up to commit `bb239b3` remain under MIT.
 - Cache schema version bumped to 3; existing caches are rebuilt automatically on next use
 
 ## [3.0.0] - 2026-07-14

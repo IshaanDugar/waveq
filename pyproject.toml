@@ -13,7 +13,7 @@ authors = [{name = "Ishaan Dugar"}]
 keywords = ["vcd", "fst", "waveform", "verilog", "systemverilog", "vhdl", "fpga", "rtl", "simulation", "verification", "cocotb", "verilator", "gtkwave", "eda", "mcp", "model-context-protocol", "ai-agent", "llm"]
 classifiers = [
   "Development Status :: 4 - Beta",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",

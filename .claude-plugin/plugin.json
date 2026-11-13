@@ -8,7 +8,7 @@
   },
   "homepage": "https://ishaandugar.github.io/waveq/",
   "repository": "https://github.com/IshaanDugar/waveq",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "keywords": [
     "vcd",
     "fst",

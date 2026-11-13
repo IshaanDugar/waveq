@@ -63,3 +63,7 @@ python benchmarks/benchmark_waveq.py --output reports
 ## Questions
 
 Open a [GitHub issue](https://github.com/IshaanDugar/waveq/issues) for bugs, feature ideas, or setup help.
+
+## License
+
+WaveQ is licensed under the GNU AGPL-3.0-or-later. By contributing, you agree that your contribution is licensed under the same terms.

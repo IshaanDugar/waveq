@@ -1,7 +1,7 @@
 # WaveQ
 
 [![CI](https://github.com/IshaanDugar/waveq/actions/workflows/ci.yml/badge.svg)](https://github.com/IshaanDugar/waveq/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 **Your AI assistant can read code — WaveQ lets it read waveforms too.**
@@ -254,7 +254,9 @@ docs/install/    MCP client setup guides
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later — see [LICENSE](LICENSE).
+
+WaveQ is free for everyone to use, study, change and share. If you distribute a modified version, or run one as a service for others, you must publish your source under the same license. Versions up to and including commit `bb239b3` were released under the MIT license.
 
 Originally developed by Ishaan Dugar during an internship at Ambiq Micro. Ambiq Micro is not the author or maintainer of this project.
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ishaan Dugar
 """Input formats: what WaveQ reads natively, what it converts with open tools, and what it explains.
 
 Native: VCD and Extended VCD (IEEE 1364), optionally gzipped.
