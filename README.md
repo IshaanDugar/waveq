@@ -72,7 +72,8 @@ See [AGENTS.md](AGENTS.md) for the recommended tool workflow.
 - Resolve fuzzy signal names to exact hierarchical paths
 - Query values at a time, changes in a window, edges, and stability
 - Summarize a debug window with `window_digest` instead of raw dumps
-- Find when conditions held with `find_times` — e.g. every cycle where `valid==1 && ready==1` at a rising clock edge
+- Find when conditions held with `find_times` — e.g. every cycle where `valid==1 && ready==1` at a rising clock edge — and sample the payload (address, data) of each match in the same call
+- Debug helpers: `x_report` (where did this X come from?), `activity` (where did a hung design go quiet?), `state_transitions` (FSM summary), `pair_events` (request→response latency and requests that never completed), `list_scopes` (browse the hierarchy)
 - Build a clock cycle index and query by cycle
 - Return `ok: false` on missing signals, bad times, or partial batch failures — no silent success
 
@@ -82,7 +83,7 @@ WaveQ is **not** a simulator, waveform viewer, assertion engine, or protocol che
 
 ## How it works
 
-WaveQ is size-aware. Small VCDs may auto-index on configure; larger files stay metadata-only until you explicitly call `build_index`.
+WaveQ is size-aware. Small VCDs may auto-index on configure; larger files stay metadata-only until you explicitly call `build_index`, or pass `index="full"` to `configure_waveform` to index in one call.
 
 | VCD size | Class | Default on `configure_waveform` |
 |---------:|-------|----------------------------------|
@@ -91,11 +92,13 @@ WaveQ is size-aware. Small VCDs may auto-index on configure; larger files stay m
 | 50–250 MB | large | Metadata only |
 | > 250 MB | huge | Metadata only |
 
+The cache goes in `.waveq_cache` next to the VCD, except when that folder is synced (OneDrive, Dropbox, Google Drive, iCloud) or read-only: then it goes in the per-user cache directory (`%LOCALAPPDATA%\waveq\cache`, `~/Library/Caches/waveq`, or `~/.cache/waveq`). Set `WAVEQ_CACHE_DIR` or pass `cache_dir` to choose explicitly.
+
 Recommended agent workflow:
 
-1. `configure_waveform` → 2. `index_status` → 3. `build_index` if needed → 4. `resolve_signals` → 5. `define_clock` (for cycles) → 6. `window_digest` near the failure → 7. follow up with `values_at`, `changes_many`, `edges`, or `find_times` for "when did X happen?"
+1. `configure_waveform` (with `index="full"` if you will query it) → 2. `list_scopes` / `resolve_signals` → 3. `define_clock` (for cycles) → 4. `window_digest` near the failure → 5. follow up with `values_at`, `changes_many`, `edges`, or `find_times` for "when did X happen?"
 
-### MCP tools (19)
+### MCP tools (24)
 
 | Tool | Purpose |
 |------|---------|
@@ -109,10 +112,15 @@ Recommended agent workflow:
 | `edges` / `first_edge_after` | Precomputed edge facts |
 | `stable_between` | Held-value check over a range |
 | `window_digest` | Compact "what changed here?" summary |
-| `find_times` | When/whether conditions held: time intervals, or clock cycles (sampled before the edge) |
+| `find_times` | When/whether conditions held: time intervals, or clock cycles (sampled before the edge), optionally with each match's payload values |
 | `define_clock` | Build cycle index from clock edges |
 | `time_to_cycle` / `cycle_to_time` | Time ↔ cycle conversion |
-| `values_at_cycle` / `changes_by_cycle` | Cycle-based queries |
+| `values_at_cycle` / `changes_by_cycle` | Cycle-based queries (`sample="before"` matches `find_times`) |
+| `list_scopes` | Browse the hierarchy with signal counts (metadata only, no index needed) |
+| `x_report` | Signals holding x/z at a time, earliest-to-go-unknown first |
+| `activity` | Last change per signal and idle signals — where a hung design went quiet |
+| `state_transitions` | From→to transition counts and time spent in each value |
+| `pair_events` | Pair request/response cycles (in order, or per ID): latency stats, unmatched requests, orphan responses |
 
 ### Result shape
 
@@ -183,7 +191,12 @@ waveq values <vcd> <time> <signal> [...]
 waveq changes <vcd> <signal> <start> <end>
 waveq edges <vcd> <signal> --kind rise --start 0ns --end 50ns
 waveq digest <vcd> <center> <radius> [--scope <hier>]
-waveq find <vcd> "tb.valid==1" "tb.ready==1" [--clock tb.clk] [--sample before|at] [--limit N]
+waveq find <vcd> "tb.valid==1" "tb.ready==1" [--clock tb.clk] [--sample before|at] [--limit N] [--payload tb.data]
+waveq scopes <vcd> [prefix] [--max-depth N]
+waveq xreport <vcd> [--time 500ns] [--scope u_core]
+waveq activity <vcd> [--start 0ns] [--end 1us] [--scope u_core] [--ignore tb.clk]
+waveq transitions <vcd> tb.u_fsm.state
+waveq pair <vcd> --clock tb.clk --request "tb.arvalid==1" "tb.arready==1" --response "tb.rvalid==1" "tb.rready==1" "tb.rlast==1" [--request-id tb.arid --response-id tb.rid]
 ```
 
 ## Development

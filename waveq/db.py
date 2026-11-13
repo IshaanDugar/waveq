@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import sys
 import time
 
 from . import __version__
@@ -69,13 +70,58 @@ def connect(db_path: str | Path, readonly: bool = False) -> sqlite3.Connection:
         con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     if not readonly:
+        # Long-lived query connection: a bigger page cache and memory-mapped reads keep repeated
+        # lookups off the file-read path.
         con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA temp_store=MEMORY")
+        con.execute("PRAGMA cache_size=-65536")
+        con.execute("PRAGMA mmap_size=268435456")
     return con
 
 
+_SYNCED_ROOT_ENV = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+_SYNCED_DIR_NAMES = ("onedrive", "dropbox", "google drive", "icloud drive", "icloud~", "mobile documents")
+
+
+def user_cache_dir() -> Path:
+    """Per-user cache root (used when the VCD's own folder is a poor place for a SQLite cache)."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "waveq" / "cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "waveq"
+    return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "waveq"
+
+
+def _in_synced_folder(path: Path) -> bool:
+    """True for folders that a file-sync client watches (OneDrive, Dropbox, Google Drive, iCloud).
+
+    SQLite writes there are slow and sync clients can lock the file mid-build.
+    """
+    for var in _SYNCED_ROOT_ENV:
+        root = os.environ.get(var)
+        if root:
+            try:
+                if path.is_relative_to(Path(root).resolve()):
+                    return True
+            except (OSError, ValueError):
+                pass
+    parts = [part.lower() for part in path.parts]
+    return any(name in part for part in parts for name in _SYNCED_DIR_NAMES)
+
+
 def default_cache_dir_for(vcd_path: str | Path) -> Path:
+    """Where the cache lives when no cache_dir is given.
+
+    WAVEQ_CACHE_DIR wins; otherwise `.waveq_cache` next to the VCD, unless that folder is synced
+    or not writable, in which case the per-user cache directory is used.
+    """
+    env = os.environ.get("WAVEQ_CACHE_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
     p = Path(vcd_path).resolve()
+    if _in_synced_folder(p.parent) or not os.access(p.parent, os.W_OK):
+        return user_cache_dir()
     return p.parent / ".waveq_cache"
 
 
@@ -309,35 +355,37 @@ def _value_flags(raw: str) -> tuple[int, int, str | None]:
     return has_x, has_z, int_value
 
 
-def _classify_edge(prev: str, new: str, width: int) -> str:
-    p = prev.lower()
-    n = new.lower()
-    if width == 1 and p == "0" and n == "1":
-        return "rise"
-    if width == 1 and p == "1" and n == "0":
-        return "fall"
-    p_has_x, p_has_z, _ = _value_flags(p)
-    n_has_x, n_has_z, _ = _value_flags(n)
-    if not p_has_x and n_has_x:
-        return "x_enter"
-    if p_has_x and not n_has_x:
-        return "x_exit"
-    if not p_has_z and n_has_z:
-        return "z_enter"
-    if p_has_z and not n_has_z:
-        return "z_exit"
-    if width == 1:
-        return "scalar_change"
-    return "vector_change"
+def _open_build_db(tmp_path: Path) -> sqlite3.Connection:
+    """Connection for building a cache into a throwaway temp file.
+
+    The file is renamed over the real cache only after a complete build, so a crash just leaves
+    a .tmp to discard: journaling and fsync buy nothing here and cost a lot of insert time.
+    """
+    con = sqlite3.connect(tmp_path)
+    con.row_factory = sqlite3.Row
+    con.executescript(
+        """
+        PRAGMA journal_mode=OFF;
+        PRAGMA synchronous=OFF;
+        PRAGMA locking_mode=EXCLUSIVE;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA cache_size=-131072;
+        """
+    )
+    return con
+
+
+def _finish_build_db(con: sqlite3.Connection) -> None:
+    con.execute("ANALYZE")
+    con.execute("PRAGMA optimize")
+    con.commit()
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
 
 
 def _create_schema(con: sqlite3.Connection) -> None:
     con.executescript(
         """
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-        PRAGMA temp_store=MEMORY;
-
         CREATE TABLE meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -411,22 +459,15 @@ def _create_indexes(con: sqlite3.Connection, level: str) -> None:
     if level in {"changes", "runs", "edges", "full"}:
         con.executescript(
             """
-            CREATE INDEX IF NOT EXISTS idx_changes_sig_tick_value ON changes(signal_id, tick, value_id);
             CREATE INDEX IF NOT EXISTS idx_changes_tick_sig_value ON changes(tick, signal_id, value_id);
             """
         )
-    if level in {"runs", "full"}:
-        con.executescript(
-            """
-            CREATE INDEX IF NOT EXISTS idx_runs_value_at ON signal_runs(signal_id, start_tick DESC, end_tick, value_id);
-            CREATE INDEX IF NOT EXISTS idx_runs_window ON signal_runs(signal_id, start_tick, end_tick, value_id);
-            """
-        )
+    # changes, signal_runs and signal_edges are WITHOUT ROWID tables whose primary keys start with
+    # signal_id, so per-signal lookups (forward or backward) are already covered by the table itself.
     if level in {"edges", "full"}:
         con.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_edges_sig_kind_tick ON signal_edges(signal_id, edge_kind, tick);
-            CREATE INDEX IF NOT EXISTS idx_edges_tick_sig_kind ON signal_edges(tick, signal_id, edge_kind);
             CREATE INDEX IF NOT EXISTS idx_clock_tick ON clock_edges(clock_signal_id, edge_kind, tick, cycle_index);
             """
         )
@@ -574,8 +615,7 @@ def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None =
     if tmp_path.exists():
         tmp_path.unlink()
     start = time.perf_counter()
-    con = sqlite3.connect(tmp_path)
-    con.row_factory = sqlite3.Row
+    con = _open_build_db(tmp_path)
     _create_schema(con)
     source_stat = source.stat()
     _insert_meta(con, {
@@ -595,12 +635,7 @@ def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None =
     meta["build_state"] = "metadata_ready"
     _insert_meta(con, meta)
     _create_indexes(con, "metadata")
-    con.execute("ANALYZE")
-    con.execute("PRAGMA optimize")
-    con.commit()
-    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    con.execute("PRAGMA journal_mode=DELETE")
-    con.close()
+    _finish_build_db(con)
     _replace_cache(tmp_path, db_path)
     return BuildStats(
         db_path=db_path,
@@ -659,8 +694,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     if tmp_path.exists():
         tmp_path.unlink()
     start = time.perf_counter()
-    con = sqlite3.connect(tmp_path)
-    con.row_factory = sqlite3.Row
+    con = _open_build_db(tmp_path)
     _create_schema(con)
 
     source_stat = source.stat()
@@ -684,6 +718,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     run_count = 0
     edge_count = 0
     value_ids: dict[str, int] = {}
+    value_xz: dict[int, tuple[int, int]] = {}
     current_value: dict[int, str] = {}
     current_run_start: dict[int, int] = {}
     pending_final_by_id: dict[str, str] = {}
@@ -707,7 +742,27 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         else:
             vid = int(con.execute("SELECT value_id FROM values_interned WHERE raw_value=?", (raw,)).fetchone()[0])
         value_ids[raw] = vid
+        value_xz[vid] = (has_x, has_z)
         return vid
+
+    def classify(prev: str, new: str, prev_vid: int, new_vid: int, scalar: bool) -> str:
+        # Edge kind from canonical raw values; x/z flags are computed once per interned value.
+        if scalar:
+            if prev == "0" and new == "1":
+                return "rise"
+            if prev == "1" and new == "0":
+                return "fall"
+        p_has_x, p_has_z = value_xz[prev_vid]
+        n_has_x, n_has_z = value_xz[new_vid]
+        if not p_has_x and n_has_x:
+            return "x_enter"
+        if p_has_x and not n_has_x:
+            return "x_exit"
+        if not p_has_z and n_has_z:
+            return "z_enter"
+        if p_has_z and not n_has_z:
+            return "z_exit"
+        return "scalar_change" if scalar else "vector_change"
 
     value_id("x")  # every signal starts as x before its first dump
 
@@ -740,7 +795,9 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
                     runs_batch.append((sig.signal_id, start_tick, final_tick, value_id(prev)))
                     run_count += 1
                 if build_edges:
-                    edges_batch.append((sig.signal_id, final_tick, value_id(prev), value_id(raw), _classify_edge(prev, raw, sig.width)))
+                    prev_vid = value_id(prev)
+                    new_vid = value_id(raw)
+                    edges_batch.append((sig.signal_id, final_tick, prev_vid, new_vid, classify(prev, raw, prev_vid, new_vid, sig.width == 1)))
                     edge_count += 1
                 current_value[sig.signal_id] = raw
                 current_run_start[sig.signal_id] = final_tick
@@ -840,12 +897,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         row = con.execute("SELECT signal_id FROM signals WHERE full_path=?", (full_path,)).fetchone()
         if row:
             rebuild_clock_edges(con, int(row[0]), edge_kind)
-    con.execute("ANALYZE")
-    con.execute("PRAGMA optimize")
-    con.commit()
-    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    con.execute("PRAGMA journal_mode=DELETE")
-    con.close()
+    _finish_build_db(con)
     _replace_cache(tmp_path, db_path)
     elapsed = time.perf_counter() - start
     return BuildStats(

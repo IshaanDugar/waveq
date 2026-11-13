@@ -7,7 +7,7 @@ from typing import Any
 
 from . import __version__
 from .db import EDGE_KINDS
-from .engine import FIND_SAMPLES, WaveQEngine
+from .engine import CONFIGURE_INDEX_MODES, FIND_SAMPLES, WaveQEngine
 
 
 def print_json(obj: Any) -> None:
@@ -26,7 +26,7 @@ def parse_condition(text: str) -> dict[str, str]:
 
 def configured_engine(args: argparse.Namespace) -> tuple[WaveQEngine, dict[str, Any]]:
     eng = WaveQEngine()
-    result = eng.configure(args.vcd, getattr(args, "cache_dir", None), getattr(args, "rebuild", False))
+    result = eng.configure(args.vcd, getattr(args, "cache_dir", None), getattr(args, "rebuild", False), getattr(args, "index", "auto"))
     return eng, result
 
 
@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("vcd", help="Path to .vcd or .vcd.gz")
         sp.add_argument("--cache-dir", default=None, help="Optional cache directory")
         sp.add_argument("--rebuild", action="store_true", help="Force cache rebuild")
+        sp.add_argument("--index", choices=CONFIGURE_INDEX_MODES, default="auto", help="auto: full index under 10 MB; full: always; metadata: never")
 
     sp = sub.add_parser("configure", help="Configure metadata/cache for a VCD"); add_common(sp)
     sp = sub.add_parser("index-status", help="Check cache/index readiness without rebuilding"); sp.add_argument("vcd", help="Path to .vcd or .vcd.gz"); sp.add_argument("--cache-dir", default=None, help="Optional cache directory")
@@ -50,7 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("changes", help="List changes for a signal in a time window"); add_common(sp); sp.add_argument("signal"); sp.add_argument("start"); sp.add_argument("end"); sp.add_argument("--limit", type=int, default=200)
     sp = sub.add_parser("edges", help="List precomputed edges"); add_common(sp); sp.add_argument("signal"); sp.add_argument("--kind", choices=EDGE_KINDS); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=200)
     sp = sub.add_parser("digest", help="Summarize a window around a time"); add_common(sp); sp.add_argument("center_time"); sp.add_argument("radius"); sp.add_argument("--signals", nargs="*"); sp.add_argument("--scope"); sp.add_argument("--max-signals", type=int, default=30)
-    sp = sub.add_parser("find", help="Find when conditions hold (ANDed), as intervals or clock cycles"); add_common(sp); sp.add_argument("conditions", nargs="+", type=parse_condition, metavar="SIGNAL==VALUE"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--clock", help="Match per clock edge instead of returning intervals"); sp.add_argument("--edge", choices=["rise", "fall"], default="rise"); sp.add_argument("--sample", choices=FIND_SAMPLES, default="before"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("find", help="Find when conditions hold (ANDed), as intervals or clock cycles"); add_common(sp); sp.add_argument("conditions", nargs="+", type=parse_condition, metavar="SIGNAL==VALUE"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--clock", help="Match per clock edge instead of returning intervals"); sp.add_argument("--edge", choices=["rise", "fall"], default="rise"); sp.add_argument("--sample", choices=FIND_SAMPLES, default="before"); sp.add_argument("--limit", type=int, default=100); sp.add_argument("--payload", nargs="*", help="Signals to sample at each match")
+    sp = sub.add_parser("scopes", help="Browse the scope hierarchy"); add_common(sp); sp.add_argument("prefix", nargs="?"); sp.add_argument("--max-depth", type=int, default=1); sp.add_argument("--limit", type=int, default=200)
+    sp = sub.add_parser("xreport", help="Signals holding x/z at a time, earliest first"); add_common(sp); sp.add_argument("--time"); sp.add_argument("--scope"); sp.add_argument("--limit", type=int, default=100)
+    sp = sub.add_parser("activity", help="Last change per signal and idle signals in a window"); add_common(sp); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--scope"); sp.add_argument("--ignore", nargs="*"); sp.add_argument("--limit", type=int, default=50)
+    sp = sub.add_parser("transitions", help="FSM transition counts and time per value"); add_common(sp); sp.add_argument("signal"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--limit", type=int, default=50)
+    sp = sub.add_parser("pair", help="Pair request/response cycles and report latency and unmatched requests"); add_common(sp); sp.add_argument("--clock", required=True); sp.add_argument("--request", nargs="+", type=parse_condition, required=True, metavar="SIGNAL==VALUE"); sp.add_argument("--response", nargs="+", type=parse_condition, required=True, metavar="SIGNAL==VALUE"); sp.add_argument("--edge", choices=["rise", "fall"], default="rise"); sp.add_argument("--sample", choices=FIND_SAMPLES, default="before"); sp.add_argument("--start"); sp.add_argument("--end"); sp.add_argument("--request-id"); sp.add_argument("--response-id"); sp.add_argument("--allow-same-cycle", action="store_true"); sp.add_argument("--limit", type=int, default=100)
     sub.add_parser("mcp", help="Run the MCP stdio server")
 
     args = p.parse_args(argv)
@@ -92,7 +98,15 @@ def main(argv: list[str] | None = None) -> int:
             if not clk.get("ok"):
                 result = clk
         if result is None:
-            result = eng.find_times(args.conditions, args.start, args.end, args.clock, args.edge, args.sample, args.limit)
+            result = eng.find_times(args.conditions, args.start, args.end, args.clock, args.edge, args.sample, args.limit, args.payload)
+    elif args.cmd == "scopes": result = eng.list_scopes(args.prefix, args.max_depth, args.limit)
+    elif args.cmd == "xreport": result = eng.x_report(args.time, args.scope, args.limit)
+    elif args.cmd == "activity": result = eng.activity(args.start, args.end, args.scope, args.ignore, args.limit)
+    elif args.cmd == "transitions": result = eng.state_transitions(args.signal, args.start, args.end, args.limit)
+    elif args.cmd == "pair":
+        result = eng.define_clock(args.clock, args.edge)
+        if result.get("ok"):
+            result = eng.pair_events(args.clock, args.request, args.response, args.edge, args.sample, args.start, args.end, args.request_id, args.response_id, args.allow_same_cycle, args.limit)
     else: raise AssertionError(args.cmd)
     print_json(result)
     return 0 if result.get("ok") else 1

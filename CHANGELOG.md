@@ -9,11 +9,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `find_times` MCP tool and `waveq find` CLI command: find when ANDed conditions (`==`/`!=` against x, z, decimal, hex, or binary) hold, as time intervals or as clock cycles sampled just before (default) or at each edge
+- `find_times` `payload`: sample extra signals (address, data, IDs) at every match in the same pass, returned as width-padded hex
+- `list_scopes`: browse the hierarchy with direct and subtree signal counts; works on metadata alone, before any index build
+- `x_report`: signals holding x/z at a time, ordered by when their unknown stretch began, to trace an X back to its origin
+- `activity`: per-signal last-change times and idle signals in a window (with `ignore` for clocks) to locate where a hung design went quiet
+- `state_transitions`: from→to transition counts with first/last times, and time spent in each value
+- `pair_events`: pair request and response cycles in order (or in order per ID) and report latency stats, unmatched requests, and orphan responses
+- `configure_waveform` `index` option (`auto`, `full`, `metadata`): `full` makes any file query-ready in one call
+- `values_at_cycle` `sample` option: `before` reads just before the edge, matching `find_times`
+- `value_at` / `values_at` results include a `hex` field for fully known vectors
+- `WAVEQ_CACHE_DIR` environment variable; the default cache moves to the per-user cache directory when the VCD's folder is synced (OneDrive, Dropbox, Google Drive, iCloud) or read-only
+- CLI commands `scopes`, `xreport`, `activity`, `transitions`, `pair`; `find --payload`; `--index` on every command that configures
 
 ### Performance
 
 - `window_digest` gathers values and counts for all signals in a fixed number of batched queries instead of several per signal (~5x faster in the benchmark)
 - `values_at` reads all held values in one query
+- Index builds write the temporary database without journaling or fsync (it is renamed into place only when complete) and classify edges from per-value x/z flags computed once: full builds ~2x faster in the benchmark
+- Dropped four indexes that duplicated `WITHOUT ROWID` primary keys or were never used: caches ~40% smaller
+- Resolved signal names and defined clocks are memoized per open cache; cycle tools no longer count every clock cycle on each call
+- Query connection uses a larger page cache and memory-mapped reads
 
 ### Fixed
 

@@ -555,6 +555,294 @@ b00000001 "
         self.assertIn("$enddefinitions", r["summary"])
 
 
+# Bus/handshake waveform: clk rises at 10c+5 (cycle c); stimulus changes at 10c, so "before the edge" is clean.
+# Requests at cycles 1 (id 1), 2 (id 2), 5 (id 3); responses at cycles 4 (rid 2) and 6 (rid 1); id 3 never completes.
+_BUS_VCD_HEADER = """$timescale 1 ns $end
+$scope module tb $end
+$var wire 1 ! clk $end
+$scope module bus $end
+$var wire 1 " req $end
+$var wire 1 # rsp $end
+$var wire 2 $ id [1:0] $end
+$var wire 2 % rid [1:0] $end
+$var wire 1 & stuck $end
+$var wire 2 ' st [1:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+"""
+_BUS_STIMULUS = {
+    0: ['0"', '0#', 'b00 $', 'b00 %', '1&', "b00 '"],
+    10: ['1"', 'b01 $', "b01 '"],
+    20: ['b10 $', "b10 '"],
+    30: ['0"', "b00 '"],
+    40: ['1#', 'b10 %', "b01 '"],
+    50: ['0#', '1"', 'b11 $', "b10 '"],
+    60: ['0"', '1#', 'b01 %', "b00 '"],
+    70: ['0#'],
+}
+
+
+def write_bus_vcd(path: pathlib.Path) -> pathlib.Path:
+    lines = [_BUS_VCD_HEADER]
+    for t in range(0, 101, 5):
+        lines.append(f"#{t}")
+        if t == 0:
+            lines.append("$dumpvars")
+        lines.append("1!" if t % 10 == 5 else "0!")
+        lines.extend(_BUS_STIMULUS.get(t, []))
+        if t == 0:
+            lines.append("$end")
+    return write_text(path, "\n".join(lines) + "\n")
+
+
+# X/Z origins: d is x from the start, c goes z at 10, f goes partly z at 12 then fully z at 14,
+# a goes x at 20, recovers at 25, and goes x again at 30; b goes x at 40 (and changes while x at 45);
+# e (in core2, a different scope) goes x at 50.
+_XZ_VCD = """$timescale 1 ns $end
+$scope module tb $end
+$scope module core $end
+$var wire 1 ! a $end
+$var wire 4 " b [3:0] $end
+$var wire 1 # c $end
+$var wire 1 $ d $end
+$var wire 2 & f [1:0] $end
+$upscope $end
+$scope module core2 $end
+$var wire 2 % e [1:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+b0000 "
+0#
+x$
+b00 %
+b00 &
+$end
+#10
+z#
+#12
+b0z &
+#14
+bzz &
+#20
+x!
+#25
+0!
+#30
+x!
+#40
+b00x0 "
+#45
+b01x0 "
+#50
+b0x %
+#60
+"""
+
+
+class DebugToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = make_tmp_dir()
+        self.engine = WaveQEngine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, vcd: pathlib.Path) -> None:
+        r = self.engine.configure(str(vcd), cache_dir=str(self.tmp / "cache"), rebuild=True)
+        self.assertTrue(r["ok"], r)
+
+    def load_bus(self) -> None:
+        self.load(write_bus_vcd(self.tmp / "bus.vcd"))
+        self.assertTrue(self.engine.define_clock("tb.clk")["ok"])
+
+    def test_list_scopes_hierarchy_and_segment_match(self) -> None:
+        self.load(write_text(self.tmp / "xz.vcd", _XZ_VCD))
+        r = self.engine.list_scopes()
+        self.assertTrue(r["ok"], r)
+        rows = {row["scope"]: row for row in r["data"]["scopes"]}
+        self.assertEqual(rows["tb"]["signals"], 0)
+        self.assertEqual(rows["tb"]["signals_in_subtree"], 6)
+        self.assertEqual(rows["tb.core"]["signals"], 5)
+        r = self.engine.list_scopes("core", max_depth=0)
+        self.assertEqual([row["scope"] for row in r["data"]["scopes"]], ["tb.core"])
+        self.assertEqual([s["leaf"] for s in r["data"]["root_signals"]], ["a", "b", "c", "d", "f"])
+        self.assertEqual(self.engine.list_scopes("nope")["status"], "scope_not_found")
+
+    def test_list_scopes_needs_metadata_only(self) -> None:
+        vcd = write_large_metadata_vcd(self.tmp / "large.vcd")
+        r = self.engine.configure(str(vcd), cache_dir=str(self.tmp / "cache"), rebuild=True)
+        self.assertFalse(r["data"]["query_ready"])
+        r = self.engine.list_scopes()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["scopes"][0]["signals_in_subtree"], 1)
+
+    def test_x_report_orders_by_when_unknown_began(self) -> None:
+        self.load(write_text(self.tmp / "xz.vcd", _XZ_VCD))
+        r = self.engine.x_report(scope="core")
+        self.assertTrue(r["ok"], r)
+        got = [(e["signal"].split(" ")[0], e["unknown_since_tick"]) for e in r["data"]["signals"]]
+        self.assertEqual(got, [("tb.core.d", 0), ("tb.core.c", 10), ("tb.core.f", 12), ("tb.core.a", 30), ("tb.core.b", 40)])
+        self.assertTrue(r["data"]["signals"][0]["unknown_since_start"])
+        everything = self.engine.x_report()
+        self.assertIn("tb.core2.e [1:0]", [e["signal"] for e in everything["data"]["signals"]])
+        early = self.engine.x_report("22ns", scope="core")
+        self.assertEqual([(e["signal"], e["unknown_since_tick"]) for e in early["data"]["signals"]][-1], ("tb.core.a", 20))
+        self.assertEqual(self.engine.x_report("5ns", scope="core2")["status"], "no_match")
+        self.assertEqual(self.engine.x_report(scope="missing")["status"], "scope_not_found")
+
+    def test_x_report_matches_value_at(self) -> None:
+        self.load(write_text(self.tmp / "xz.vcd", _XZ_VCD))
+        for t in range(0, 61, 3):
+            reported = {e["signal"] for e in self.engine.x_report(t)["data"]["signals"]}
+            expected = set()
+            for scope in ("tb.core", "tb.core2"):
+                for leaf in ("a", "b", "c", "d", "e", "f"):
+                    v = self.engine.value_at(f"{scope}.{leaf}", t)
+                    if v["ok"] and (v["data"]["has_x"] or v["data"]["has_z"]):
+                        expected.add(v["data"]["signal"])
+            self.assertEqual(reported, expected, t)
+
+    def test_activity_finds_where_design_went_quiet(self) -> None:
+        self.load_bus()
+        r = self.engine.activity(ignore=["tb.clk"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["last_activity_tick"], 70)
+        self.assertEqual(r["data"]["most_recent"][0]["signal"], "tb.bus.rsp")
+        self.assertEqual([s["signal"] for s in r["data"]["idle"]], ["tb.bus.stuck"])
+        self.assertEqual(r["data"]["idle"][0]["end_value"], "1")
+        self.assertNotIn("tb.clk", [s["signal"] for s in r["data"]["most_recent"]])
+        # Without ignoring it, the free-running clock masks the hang.
+        self.assertEqual(self.engine.activity()["data"]["most_recent"][0]["signal"], "tb.clk")
+        late = self.engine.activity(start="70ns", ignore=["tb.clk"])
+        self.assertIsNone(late["data"]["last_activity_tick"])
+        self.assertEqual(self.engine.activity(ignore=["nope"])["status"], "bad_ignore")
+
+    def test_state_transitions_counts_and_dwell(self) -> None:
+        self.load_bus()
+        r = self.engine.state_transitions("tb.bus.st")
+        self.assertTrue(r["ok"], r)
+        trans = {(t["from"], t["to"]): t["count"] for t in r["data"]["transitions"]}
+        self.assertEqual(trans, {("x", "0x0"): 1, ("0x0", "0x1"): 2, ("0x1", "0x2"): 2, ("0x2", "0x0"): 2})
+        dwell = {v["value"]: (v["ticks"], v["visits"]) for v in r["data"]["values"]}
+        self.assertEqual(dwell, {"0x0": (61, 3), "0x1": (20, 2), "0x2": (20, 2)})
+        window = self.engine.state_transitions("tb.bus.st", "15ns", "45ns")
+        dwell = {v["value"]: v["ticks"] for v in window["data"]["values"]}
+        self.assertEqual(sum(dwell.values()), 31)
+        self.assertEqual(dwell, {"0x1": 5 + 6, "0x2": 10, "0x0": 10})
+
+    def test_find_times_payload_matches_values_at(self) -> None:
+        self.load_bus()
+        r = self.engine.find_times([{"signal": "tb.bus.req", "value": "1"}], clock="tb.clk", payload=["tb.bus.id", "tb.bus.st"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual([m["cycle_index"] for m in r["data"]["matches"]], [1, 2, 5])
+        for m in r["data"]["matches"]:
+            ref = self.engine.values_at(["tb.bus.id", "tb.bus.st"], m["sample_tick"])["data"]["values"]
+            self.assertEqual(list(m["values"].values()), [v["hex"] for v in ref])
+        intervals = self.engine.find_times([{"signal": "tb.bus.req", "value": "1"}], payload=["tb.bus.id"])
+        self.assertEqual([(m["start_tick"], m["values"]["tb.bus.id [1:0]"]) for m in intervals["data"]["matches"]], [(10, "0x1"), (50, "0x3")])
+        self.assertEqual(self.engine.find_times([{"signal": "tb.bus.req", "value": "1"}], payload=["nope"])["status"], "bad_payload")
+
+    def test_values_at_cycle_sample_modes(self) -> None:
+        self.load(FIXTURES / "sample.vcd")
+        self.assertTrue(self.engine.define_clock("tb.clk")["ok"])
+        # rst_n rises at 10ns; cycle 1 edge is 15ns. psel rises exactly on the cycle-2 edge (25ns).
+        at = self.engine.values_at_cycle(["tb.u_apb.psel"], "tb.clk", 2)
+        before = self.engine.values_at_cycle(["tb.u_apb.psel"], "tb.clk", 2, sample="before")
+        self.assertEqual(at["data"]["values"][0]["value"], "1")
+        self.assertEqual(before["data"]["values"][0]["value"], "0")
+        self.assertEqual(before["data"]["tick"], 24)
+        self.assertEqual(self.engine.values_at_cycle(["tb.u_apb.psel"], "tb.clk", 0, sample="before")["status"], "ok")
+        self.assertEqual(self.engine.values_at_cycle(["tb.u_apb.psel"], "tb.clk", 0, sample="late")["status"], "bad_sample")
+
+    def test_pair_events_in_order_and_by_id(self) -> None:
+        self.load_bus()
+        req = [{"signal": "tb.bus.req", "value": "1"}]
+        rsp = [{"signal": "tb.bus.rsp", "value": "1"}]
+        r = self.engine.pair_events("tb.clk", req, rsp)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual([(p["request_cycle"], p["response_cycle"]) for p in r["data"]["pairs"]], [(1, 4), (2, 6)])
+        self.assertEqual([u["cycle_index"] for u in r["data"]["unmatched_requests"]], [5])
+        self.assertEqual(r["data"]["latency_cycles"]["max"], 4)
+        by_id = self.engine.pair_events("tb.clk", req, rsp, request_id="tb.bus.id", response_id="tb.bus.rid")
+        self.assertTrue(by_id["ok"], by_id)
+        self.assertEqual(sorted((p["request_cycle"], p["response_cycle"], p["id"]) for p in by_id["data"]["pairs"]), [(1, 6, "0x1"), (2, 4, "0x2")])
+        self.assertEqual(by_id["data"]["unmatched_requests"], [{"cycle_index": 5, "time": "55ns", "id": "0x3"}])
+        self.assertEqual(by_id["data"]["latency_cycles"]["min"], 2)
+        self.assertEqual(self.engine.pair_events("tb.clk", req, rsp, request_id="tb.bus.id")["status"], "bad_query")
+
+    def test_pair_events_same_cycle_rule(self) -> None:
+        self.load(FIXTURES / "sample.vcd")
+        self.assertTrue(self.engine.define_clock("tb.clk")["ok"])
+        setup = [{"signal": "tb.u_apb.psel", "value": "1"}, {"signal": "tb.u_apb.penable", "value": "0"}]
+        access = [{"signal": "tb.u_apb.psel", "value": "1"}, {"signal": "tb.u_apb.penable", "value": "1"}]
+        # The testbench drives on the clock edge, so the setup phase is only visible with sample="at".
+        r = self.engine.pair_events("tb.clk", setup, access, sample="at")
+        self.assertEqual([(p["request_cycle"], p["latency_cycles"]) for p in r["data"]["pairs"]], [(2, 1)])
+        same = [{"signal": "tb.valid", "value": "1"}]
+        strict = self.engine.pair_events("tb.clk", same, same)
+        loose = self.engine.pair_events("tb.clk", same, same, allow_same_cycle=True)
+        self.assertTrue(all(p["latency_cycles"] >= 1 for p in strict["data"]["pairs"]))
+        self.assertTrue(all(p["latency_cycles"] == 0 for p in loose["data"]["pairs"]))
+        self.assertEqual(loose["data"]["unmatched_request_count"], 0)
+
+    def test_configure_index_modes(self) -> None:
+        vcd = write_large_metadata_vcd(self.tmp / "large.vcd")
+        full = self.engine.configure(str(vcd), cache_dir=str(self.tmp / "cache"), index="full")
+        self.assertTrue(full["ok"], full)
+        self.assertTrue(full["data"]["query_ready"])
+        self.assertTrue(self.engine.value_at("tb.clk", 0)["ok"])
+        self.assertEqual(self.engine.configure(str(vcd), cache_dir=str(self.tmp / "cache"), index="lazy")["status"], "bad_index_mode")
+        small = self.engine.configure(str(FIXTURES / "sample.vcd"), cache_dir=str(self.tmp / "c2"), rebuild=True, index="metadata")
+        self.assertFalse(small["data"]["query_ready"])
+
+    def test_signal_memo_is_reset_on_reopen(self) -> None:
+        self.load(FIXTURES / "sample.vcd")
+        self.assertTrue(self.engine.value_at("tb.valid", 0)["ok"])
+        self.assertIn("tb.valid", self.engine._sig_cache)
+        self.load(write_text(self.tmp / "xz.vcd", _XZ_VCD))
+        self.assertEqual(self.engine._sig_cache, {})
+        self.assertFalse(self.engine.value_at("tb.valid", 0)["ok"])
+
+
+class CacheLocationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import os
+        self.saved = {k: os.environ.get(k) for k in ("WAVEQ_CACHE_DIR", "OneDrive", "OneDriveConsumer", "OneDriveCommercial")}
+        for k in self.saved:
+            os.environ.pop(k, None)
+        self.tmp = make_tmp_dir()
+
+    def tearDown(self) -> None:
+        import os
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_env_override_and_synced_folder_fallback(self) -> None:
+        import os
+        from waveq.db import default_cache_dir_for, user_cache_dir
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        synced = self.tmp / "sync_root" / "proj"
+        synced.mkdir(parents=True)
+        vcd = plain / "a.vcd"
+        expected_plain = user_cache_dir() if "onedrive" in str(plain).lower() else plain / ".waveq_cache"
+        self.assertEqual(default_cache_dir_for(vcd), expected_plain)
+        os.environ["OneDrive"] = str(self.tmp / "sync_root")
+        self.assertEqual(default_cache_dir_for(synced / "a.vcd"), user_cache_dir())
+        os.environ["WAVEQ_CACHE_DIR"] = str(self.tmp / "explicit")
+        self.assertEqual(default_cache_dir_for(synced / "a.vcd"), (self.tmp / "explicit").resolve())
+
+
 class MCPTests(unittest.TestCase):
     def call_tool(self, name: str, arguments: dict[str, object], msg_id: int = 100) -> dict[str, object]:
         resp = handle_message({"jsonrpc": "2.0", "id": msg_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
@@ -577,6 +865,8 @@ class MCPTests(unittest.TestCase):
         self.assertIn("window_digest", names)
         self.assertIn("define_clock", names)
         self.assertIn("find_times", names)
+        for name in ("list_scopes", "x_report", "activity", "state_transitions", "pair_events"):
+            self.assertIn(name, names)
 
     def test_mcp_find_times_smoke(self) -> None:
         tmp = make_tmp_dir()
@@ -586,6 +876,16 @@ class MCPTests(unittest.TestCase):
             r = self.call_tool("find_times", {"conditions": [{"signal": "tb.valid", "value": "1"}, {"signal": "tb.ready", "value": "1"}], "clock": "tb.clk", "limit": 1})
             self.assertFalse(r["isError"], r)
             self.assertEqual([m["cycle_index"] for m in r["structuredContent"]["data"]["matches"]], [2])
+            r = self.call_tool("pair_events", {
+                "clock": "tb.clk",
+                "request": [{"signal": "tb.u_apb.psel", "value": "1"}, {"signal": "tb.u_apb.penable", "value": "0"}],
+                "response": [{"signal": "tb.u_apb.psel", "value": "1"}, {"signal": "tb.u_apb.penable", "value": "1"}],
+                "sample": "at",
+            })
+            self.assertFalse(r["isError"], r)
+            self.assertEqual(r["structuredContent"]["data"]["pair_count"], 1)
+            r = self.call_tool("find_times", {"conditions": [{"signal": "tb.valid", "value": "1"}], "clock": "tb.clk", "payload": ["tb.data"], "limit": 1})
+            self.assertEqual(r["structuredContent"]["data"]["matches"][0]["values"], {"tb.data [7:0]": "0xa5"})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

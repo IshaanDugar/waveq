@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -26,7 +27,9 @@ _SQL_CHUNK = 500
 
 FIND_OPS = ("==", "!=")
 FIND_SAMPLES = ("before", "at")
+CONFIGURE_INDEX_MODES = ("auto", "full", "metadata")
 _MAX_FIND_CONDITIONS = 16
+_PAIR_MAX_EVENTS = 200000
 
 
 def compile_condition(op: str, value: Any, width: int) -> Callable[[sqlite3.Row], bool]:
@@ -63,6 +66,22 @@ def compile_condition(op: str, value: Any, width: int) -> Callable[[sqlite3.Row]
     if op == "!=":
         return lambda row: not test(row)
     return test
+
+
+def hex_of(int_value: Any, width: int) -> str | None:
+    """0x-hex for a fully known value, zero-padded to the signal width; None when x/z/non-numeric."""
+    if int_value is None:
+        return None
+    return f"0x{int(int_value):0{max(1, (width + 3) // 4)}x}"
+
+
+def display_value(row: sqlite3.Row, width: int) -> str:
+    """Compact exact value: scalars as 0/1/x/z, known vectors as 0x-hex, otherwise the raw VCD value."""
+    if width > 1:
+        h = hex_of(row["int_value"], width)
+        if h is not None:
+            return h
+    return str(row["raw_value"])
 
 
 def ok(status: str, summary: str, data: Any = None, *, confidence: float = 1.0, limitations: list[str] | None = None) -> dict[str, Any]:
@@ -116,6 +135,9 @@ class WaveQEngine:
         self.cache_dir: str | None = None
         self.timescale: Timescale | None = None
         self.meta: dict[str, str] = {}
+        # Per-cache memo: resolved names and defined clocks. Reset whenever the cache is (re)opened.
+        self._sig_cache: dict[str, SignalRef] = {}
+        self._clock_ok: set[tuple[int, str]] = set()
 
     def close(self) -> None:
         if self.con is not None:
@@ -131,6 +153,8 @@ class WaveQEngine:
         self.cache_dir = None
         self.timescale = None
         self.meta = {}
+        self._sig_cache = {}
+        self._clock_ok = set()
 
     def _open_cache(self, db_path: Path, vcd_path: str, cache_dir: str | None = None) -> None:
         self.close()
@@ -169,13 +193,24 @@ class WaveQEngine:
         size = p.stat().st_size if p and p.exists() else 0
         return {"vcd_size_mb": round(size / (1024 * 1024), 3), "size_class": size_class_for_bytes(size)}
 
-    def configure(self, vcd_path: str, cache_dir: str | None = None, rebuild: bool = False) -> dict[str, Any]:
+    def configure(self, vcd_path: str, cache_dir: str | None = None, rebuild: bool = False, index: str = "auto") -> dict[str, Any]:
+        """Open (or build) the cache for a VCD.
+
+        index="auto" fully indexes small files and does metadata only for larger ones; "full" always
+        leaves the cache query-ready in one call; "metadata" never parses the dump body.
+        """
         started = time.perf_counter()
         try:
+            if index not in CONFIGURE_INDEX_MODES:
+                return fail("bad_index_mode", f"index must be one of: {', '.join(CONFIGURE_INDEX_MODES)}", {"allowed": list(CONFIGURE_INDEX_MODES)})
             source = Path(vcd_path).expanduser().resolve()
             size_class = size_class_for_bytes(source.stat().st_size)
             prior = cache_status(source, cache_dir)
-            if not rebuild and prior.get("cache_valid") and "metadata" in prior.get("ready_levels", []):
+            want_full = index == "full" or (index == "auto" and size_class == "small")
+            prior_ready = prior.get("ready_levels", [])
+            if not rebuild and prior.get("cache_valid") and "metadata" in prior_ready and (
+                not want_full or all(level in prior_ready for level in ("changes", "runs", "edges"))
+            ):
                 stats = BuildStats(
                     db_path=cache_path_for(source, cache_dir),
                     signal_count=int(prior.get("metadata", {}).get("signal_count", 0)),
@@ -190,7 +225,7 @@ class WaveQEngine:
                     built_level="metadata",
                     reused=True,
                 )
-            elif size_class == "small":
+            elif want_full:
                 self.close()
                 stats = build_database(vcd_path, cache_dir, rebuild=rebuild, level="full")
             else:
@@ -403,6 +438,16 @@ class WaveQEngine:
         return rows
 
     def get_signal(self, name: str) -> SignalRef | dict[str, Any]:
+        key = name.strip().lower()
+        cached = self._sig_cache.get(key)
+        if cached is not None:
+            return cached
+        sig = self._lookup_signal(name)
+        if isinstance(sig, SignalRef):
+            self._sig_cache[key] = sig
+        return sig
+
+    def _lookup_signal(self, name: str) -> SignalRef | dict[str, Any]:
         rows = self._get_signal_exact_rows(name)
         if len(rows) == 1:
             return SignalRef.from_row(rows[0])
@@ -462,8 +507,13 @@ class WaveQEngine:
         sig = self.get_signal(clock)
         if isinstance(sig, dict):
             return sig
-        if self._clock_cycle_count(sig, edge) == 0:
+        if (sig.signal_id, edge) in self._clock_ok:
+            return sig
+        if self.require().execute(
+            "SELECT 1 FROM clock_edges WHERE clock_signal_id=? AND edge_kind=? LIMIT 1", (sig.signal_id, edge)
+        ).fetchone() is None:
             return fail("clock_not_defined", f"{sig.full_path} has no {edge}-edge cycle index; call define_clock first", {"clock": sig.full_path, "edge": edge})
+        self._clock_ok.add((sig.signal_id, edge))
         return sig
 
     def value_at(self, signal: str, time_value: str | int) -> dict[str, Any]:
@@ -514,6 +564,7 @@ class WaveQEngine:
             "time": self.format_tick(tick),
             "value": row["raw_value"],
             "int_value": row["int_value"],
+            "hex": hex_of(row["int_value"], sig.width) if sig.width > 1 else None,
             "has_x": bool(row["has_x"]),
             "has_z": bool(row["has_z"]),
             "held_from_tick": int(row["start_tick"]),
@@ -875,13 +926,14 @@ class WaveQEngine:
             if isinstance(sig, dict):
                 return sig
             con = self.require()
-            available = int(con.execute(
-                "SELECT COUNT(*) FROM signal_edges WHERE signal_id=? AND edge_kind=?", (sig.signal_id, edge)
-            ).fetchone()[0])
-            if available == 0:
+            available = con.execute(
+                "SELECT 1 FROM signal_edges WHERE signal_id=? AND edge_kind=? LIMIT 1", (sig.signal_id, edge)
+            ).fetchone()
+            if available is None:
                 return fail("no_clock_edges", f"{sig.full_path} has no {edge} edges; it cannot be used as a {edge}-edge clock", {"clock": sig.full_path, "edge": edge})
             cycles = rebuild_clock_edges(con, sig.signal_id, edge)
             con.commit()
+            self._clock_ok.add((sig.signal_id, edge))
             return ok("ok", f"Defined clock {sig.full_path} on {edge} edges with {cycles} cycle(s)", {"clock": sig.full_path, "edge": edge, "cycles": cycles})
         except Exception as exc:
             return fail("define_clock_failed", str(exc))
@@ -923,11 +975,20 @@ class WaveQEngine:
         except Exception as exc:
             return fail("cycle_to_time_failed", str(exc))
 
-    def values_at_cycle(self, signals: list[str], clock: str, cycle_index: int, edge: str = "rise") -> dict[str, Any]:
+    def values_at_cycle(self, signals: list[str], clock: str, cycle_index: int, edge: str = "rise", sample: str = "at") -> dict[str, Any]:
+        """Values at a clock cycle. sample="at" reads at the edge tick (post-edge, the historical
+        default); sample="before" reads one tick earlier, the flip-flop view find_times uses."""
+        if sample not in FIND_SAMPLES:
+            return fail("bad_sample", f"sample must be one of: {', '.join(FIND_SAMPLES)}", {"allowed": list(FIND_SAMPLES)})
         cyc = self.cycle_to_time(clock, cycle_index, edge=edge)
         if not cyc.get("ok"):
             return cyc
-        return self.values_at(signals, int(cyc["data"]["tick"]))
+        tick = int(cyc["data"]["tick"]) - (1 if sample == "before" else 0)
+        if tick < 0:
+            return fail("no_pre_edge_sample", f"cycle {cycle_index} is at tick 0, so there is no value just before its edge", {"cycle_index": int(cycle_index)})
+        result = self.values_at(signals, tick)
+        result.setdefault("data", {}).update({"clock": cyc["data"]["clock"], "edge": edge, "cycle_index": int(cycle_index), "edge_tick": int(cyc["data"]["tick"]), "sample": sample})
+        return result
 
     def changes_by_cycle(self, signal: str, clock: str, start_cycle: int, end_cycle: int, edge: str = "rise", limit: int = 200) -> dict[str, Any]:
         a = self.cycle_to_time(clock, start_cycle, edge=edge)
@@ -978,6 +1039,31 @@ class WaveQEngine:
                     current[i] = nxt
             t = end
 
+    def _sampler(self, signal_ids: list[int], a: int, b: int) -> Callable[[int], tuple[sqlite3.Row, ...]]:
+        """Return at(tick) giving each signal's held row; ticks must be non-decreasing within [a, b].
+
+        Walks the runs forward once, so sampling many increasing ticks costs one pass, not one query each.
+        """
+        segments = self._segments(signal_ids, a, b)
+        state = list(next(segments))
+
+        def at(tick: int) -> tuple[sqlite3.Row, ...]:
+            while state[1] <= tick:
+                state[:] = next(segments)
+            return state[2]
+        return at
+
+    def _resolve_payload(self, payload: list[str] | None) -> tuple[list[SignalRef], list[dict[str, Any]]]:
+        sigs: list[SignalRef] = []
+        errors: list[dict[str, Any]] = []
+        for name in payload or []:
+            sig = self.get_signal(str(name))
+            if isinstance(sig, dict):
+                errors.append({"signal": name, "status": sig.get("status"), "summary": sig.get("summary"), "data": sig.get("data")})
+            elif all(s.signal_id != sig.signal_id for s in sigs):
+                sigs.append(sig)
+        return sigs, errors
+
     def find_times(
         self,
         conditions: list[dict[str, Any]],
@@ -987,8 +1073,28 @@ class WaveQEngine:
         edge: str = "rise",
         sample: str = "before",
         limit: int = 100,
+        payload: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Find when all conditions hold: as time intervals, or as clock cycles when a clock is given."""
+        """Find when all conditions hold: as time intervals, or as clock cycles when a clock is given.
+
+        payload signals are sampled at each match (the interval start, or the cycle's sample tick)
+        and returned per match, so "every handshake and its data" is one call.
+        """
+        return self._find_times(conditions, start, end, clock, edge, sample, limit, payload, max_limit=10000)
+
+    def _find_times(
+        self,
+        conditions: list[dict[str, Any]],
+        start: str | int | None,
+        end: str | int | None,
+        clock: str | None,
+        edge: str,
+        sample: str,
+        limit: int,
+        payload: list[str] | None,
+        *,
+        max_limit: int,
+    ) -> dict[str, Any]:
         try:
             need = self._index_required("runs")
             if need:
@@ -1021,14 +1127,24 @@ class WaveQEngine:
                 described.append({"signal": sig.full_path, "op": op, "value": str(cond["value"])})
             if errors:
                 return fail("bad_condition", "One or more conditions could not be evaluated", {"errors": errors})
+            payload_sigs, payload_errors = self._resolve_payload(payload)
+            if payload_errors:
+                return fail("bad_payload", "One or more payload signals could not be resolved", {"errors": payload_errors})
 
             a = self.parse_tick(start) if start is not None else 0
             b = self.parse_tick(end) if end is not None else int(self.meta.get("max_tick", 0))
             bad = self._check_window(a, b)
             if bad:
                 return bad
-            limit = max(1, min(int(limit), 10000))
+            limit = max(1, min(int(limit), max_limit))
             ids = [s.signal_id for s in sigs]
+            payload_at: Callable[[int], tuple[sqlite3.Row, ...]] | None = None
+
+            def payload_values(tick: int) -> dict[str, str]:
+                nonlocal payload_at
+                if payload_at is None:
+                    payload_at = self._sampler([p.signal_id for p in payload_sigs], tick, b)
+                return {p.full_path: display_value(row, p.width) for p, row in zip(payload_sigs, payload_at(tick))}
             # Each predicate depends only on the value, so cache its result per interned value id.
             caches: list[dict[int, bool]] = [{} for _ in tests]
 
@@ -1050,6 +1166,9 @@ class WaveQEngine:
                 "start_time": self.format_tick(a),
                 "end_time": self.format_tick(b),
             }
+            if payload_sigs:
+                data["payload_signals"] = [{"signal": p.full_path, "width": p.width} for p in payload_sigs]
+                data["payload_format"] = "scalars 0/1/x/z; fully known vectors 0x-hex padded to width; vectors with x/z as raw VCD binary"
             limitations: list[str] = []
             truncated = False
 
@@ -1060,7 +1179,7 @@ class WaveQEngine:
                 def emit(s: int, e: int) -> bool:
                     if len(matches) >= limit:
                         return False
-                    matches.append({
+                    match = {
                         "start_tick": s,
                         "end_tick_exclusive": e,
                         "start_time": self.format_tick(s),
@@ -1068,7 +1187,10 @@ class WaveQEngine:
                         "duration_ticks": e - s,
                         "may_start_earlier": s == a and a > 0,
                         "may_continue_later": e == b + 1 and b < max_tick,
-                    })
+                    }
+                    if payload_sigs:
+                        match["values"] = payload_values(s)
+                    matches.append(match)
                     return True
 
                 open_start: int | None = None
@@ -1113,12 +1235,15 @@ class WaveQEngine:
                         if len(cycles) >= limit:
                             truncated = True
                             break
-                        cycles.append({
+                        cycle = {
                             "cycle_index": int(edge_row["cycle_index"]),
                             "edge_tick": edge_tick,
                             "edge_time": self.format_tick(edge_tick),
                             "sample_tick": sample_tick,
-                        })
+                        }
+                        if payload_sigs:
+                            cycle["values"] = payload_values(sample_tick)
+                        cycles.append(cycle)
                 data.update({
                     "mode": "clock_cycles",
                     "clock": clk.full_path,
@@ -1137,3 +1262,476 @@ class WaveQEngine:
             return ok("ok", found, data, limitations=limitations)
         except Exception as exc:
             return fail("find_times_failed", str(exc))
+
+    # ------------------------------------------------------------------ scope helpers and debug tools
+
+    def _window(self, start: str | int | None, end: str | int | None) -> tuple[int, int] | dict[str, Any]:
+        a = self.parse_tick(start) if start is not None else 0
+        b = self.parse_tick(end) if end is not None else int(self.meta.get("max_tick", 0))
+        bad = self._check_window(a, b)
+        return bad if bad else (a, b)
+
+    def _scope_rows(self) -> list[tuple[str, int]]:
+        return [(r[0], int(r[1])) for r in self.require().execute("SELECT scope, COUNT(*) FROM signals GROUP BY scope")]
+
+    @staticmethod
+    def _scope_matches(scope: str, query: str) -> bool:
+        """Segment-aligned match: 'u_apb' matches tb.u_apb and tb.u_apb.sub, never tb.u_apb2."""
+        q = query.strip().strip(".").lower()
+        return not q or f".{q}." in f".{scope.lower()}."
+
+    def _signals_in_scope(self, scope: str | None) -> list[SignalRef] | dict[str, Any]:
+        con = self.require()
+        if not scope:
+            return [SignalRef.from_row(r) for r in con.execute("SELECT * FROM signals ORDER BY full_path")]
+        scopes = [s for s, _ in self._scope_rows() if self._scope_matches(s, scope)]
+        if not scopes:
+            return fail("scope_not_found", f"No scope matched {scope!r}; call list_scopes to browse the hierarchy", {"scope": scope})
+        out: list[SignalRef] = []
+        for i in range(0, len(scopes), _SQL_CHUNK):
+            chunk = scopes[i:i + _SQL_CHUNK]
+            out.extend(SignalRef.from_row(r) for r in con.execute(
+                f"SELECT * FROM signals WHERE scope IN ({','.join('?' * len(chunk))}) ORDER BY full_path", chunk
+            ))
+        return out
+
+    def list_scopes(self, prefix: str | None = None, max_depth: int = 1, limit: int = 200) -> dict[str, Any]:
+        """Browse the design hierarchy. Works on metadata alone, before any index build."""
+        try:
+            self.require()
+            limit = max(1, min(int(limit), 2000))
+            max_depth = max(0, int(max_depth))
+            direct = dict(self._scope_rows())
+            # Every ancestor scope exists in the hierarchy even if it declares no signals itself.
+            all_scopes: dict[str, int] = {}
+            for scope, n in direct.items():
+                parts = scope.split(".")
+                for k in range(1, len(parts) + 1):
+                    all_scopes.setdefault(".".join(parts[:k]), 0)
+                all_scopes[scope] = n
+            total: dict[str, int] = dict.fromkeys(all_scopes, 0)
+            for scope, n in direct.items():
+                parts = scope.split(".")
+                for k in range(1, len(parts) + 1):
+                    total[".".join(parts[:k])] += n
+            q = (prefix or "").strip().strip(".").lower()
+            if q:
+                roots = [s for s in all_scopes if s.lower() == q or s.lower().endswith("." + q)]
+                if not roots:
+                    return fail("scope_not_found", f"No scope matched {prefix!r}", {"prefix": prefix, "top_level": sorted(s for s in all_scopes if "." not in s)[:50]})
+            else:
+                roots = [s for s in all_scopes if "." not in s]
+            rows = []
+            for root in sorted(roots):
+                depth0 = root.count(".")
+                for scope in sorted(all_scopes):
+                    if scope == root or scope.startswith(root + "."):
+                        depth = scope.count(".") - depth0
+                        if depth <= max_depth:
+                            rows.append({"scope": scope, "depth": depth, "signals": all_scopes[scope], "signals_in_subtree": total[scope]})
+            truncated = len(rows) > limit
+            data: dict[str, Any] = {"prefix": prefix, "max_depth": max_depth, "scopes": rows[:limit], "scope_count": len(rows), "truncated": truncated}
+            if len(roots) == 1:
+                sigs = [r for r in self.require().execute(
+                    "SELECT leaf, width, kind FROM signals WHERE scope=? ORDER BY leaf LIMIT 201", (roots[0],)
+                )]
+                data["root_signals"] = [{"leaf": r["leaf"], "width": int(r["width"]), "kind": r["kind"]} for r in sigs[:200]]
+                data["root_signals_truncated"] = len(sigs) > 200
+            return ok("ok", f"Found {len(rows)} scope(s)", data, limitations=["result truncated"] if truncated else [])
+        except Exception as exc:
+            return fail("list_scopes_failed", str(exc))
+
+    def x_report(self, time_value: str | int | None = None, scope: str | None = None, limit: int = 100) -> dict[str, Any]:
+        """Signals holding x/z at a time, earliest-to-go-unknown first (the likely origin of an X)."""
+        try:
+            for level in ("runs", "edges"):
+                need = self._index_required(level)
+                if need:
+                    return need
+            con = self.require()
+            tick = self.parse_tick(time_value) if time_value is not None else int(self.meta.get("max_tick", 0))
+            bad = self._check_tick_range(tick)
+            if bad:
+                return bad
+            limit = max(1, min(int(limit), 5000))
+            sigs = self._signals_in_scope(scope)
+            if isinstance(sigs, dict):
+                return sigs
+            # String values can contain the letters x/z; they are not 4-state unknowns.
+            sigs = [s for s in sigs if s.kind.lower() not in {"string", "real", "realtime"}]
+            held = self._held_rows([s.signal_id for s in sigs], tick)
+            unknown = [(s, held[s.signal_id]) for s in sigs if s.signal_id in held and (held[s.signal_id]["has_x"] or held[s.signal_id]["has_z"])]
+            ids = [s.signal_id for s, _ in unknown]
+            x_since: dict[int, int] = {}
+            for i in range(0, len(ids), _SQL_CHUNK):
+                chunk = ids[i:i + _SQL_CHUNK]
+                # An x_enter edge is exactly a no-x -> has-x transition, so the last one is when the current x began.
+                x_since.update((int(r[0]), int(r[1])) for r in con.execute(
+                    f"SELECT signal_id, MAX(tick) FROM signal_edges WHERE signal_id IN ({','.join('?' * len(chunk))}) AND edge_kind='x_enter' AND tick<=? GROUP BY signal_id",
+                    (*chunk, tick),
+                ))
+            entries = []
+            for sig, row in unknown:
+                if row["has_x"]:
+                    since = x_since.get(sig.signal_id, 0)
+                else:
+                    # z-only: walk back to the end of the last run with no z (exact even when x_enter masked z_enter).
+                    r = con.execute(
+                        """SELECT MAX(r.end_tick) FROM signal_runs r JOIN values_interned v ON v.value_id=r.value_id
+                           WHERE r.signal_id=? AND r.start_tick<=? AND v.has_z=0""",
+                        (sig.signal_id, tick),
+                    ).fetchone()
+                    since = int(r[0]) if r and r[0] is not None and int(r[0]) <= tick else 0
+                entries.append({
+                    "signal": sig.full_path,
+                    "width": sig.width,
+                    "value": row["raw_value"],
+                    "has_x": bool(row["has_x"]),
+                    "has_z": bool(row["has_z"]),
+                    "unknown_since_tick": since,
+                    "unknown_since_time": self.format_tick(since),
+                    "unknown_since_start": since == 0,
+                })
+            entries.sort(key=lambda e: (e["unknown_since_tick"], e["signal"]))
+            truncated = len(entries) > limit
+            data = {
+                "tick": tick,
+                "time": self.format_tick(tick),
+                "scope": scope,
+                "checked_signals": len(sigs),
+                "unknown_count": len(entries),
+                "x_count": sum(1 for e in entries if e["has_x"]),
+                "z_count": sum(1 for e in entries if e["has_z"]),
+                "signals": entries[:limit],
+                "truncated": truncated,
+            }
+            limitations = ["unknown_since is when the current unknown stretch began; unknown_since_start means unknown since time 0"]
+            if truncated:
+                limitations.append("result truncated at limit")
+            if not entries:
+                return ok("no_match", f"No x/z values in {len(sigs)} signal(s) at {self.format_tick(tick)}", data, limitations=limitations)
+            first = entries[0]
+            return ok(
+                "ok",
+                f"{len(entries)} signal(s) hold x/z at {self.format_tick(tick)}; earliest: {first['signal']} since {first['unknown_since_time']}",
+                data,
+                limitations=limitations,
+            )
+        except Exception as exc:
+            return fail("x_report_failed", str(exc))
+
+    def activity(self, start: str | int | None = None, end: str | int | None = None, scope: str | None = None, ignore: list[str] | None = None, limit: int = 50) -> dict[str, Any]:
+        """Which signals changed after start (up to end), when each last changed, and which stayed idle.
+
+        Answers "where did the design go quiet?" for hangs; pass clocks in ignore so they do not mask it.
+        """
+        try:
+            need = self._index_required("changes")
+            if need:
+                return need
+            con = self.require()
+            window = self._window(start, end)
+            if isinstance(window, dict):
+                return window
+            a, b = window
+            limit = max(1, min(int(limit), 5000))
+            sigs = self._signals_in_scope(scope)
+            if isinstance(sigs, dict):
+                return sigs
+            ignored_ids: set[int] = set()
+            ignore_errors = []
+            for name in ignore or []:
+                ref = self.get_signal(name)
+                if isinstance(ref, dict):
+                    ignore_errors.append({"signal": name, "status": ref.get("status"), "summary": ref.get("summary")})
+                else:
+                    ignored_ids.add(ref.signal_id)
+            if ignore_errors:
+                return fail("bad_ignore", "One or more ignore signals could not be resolved", {"errors": ignore_errors})
+            sigs = [s for s in sigs if s.signal_id not in ignored_ids]
+            stats: dict[int, tuple[int, int]] = {}
+            ids = [s.signal_id for s in sigs]
+            for i in range(0, len(ids), _SQL_CHUNK):
+                chunk = ids[i:i + _SQL_CHUNK]
+                stats.update((int(r[0]), (int(r[1]), int(r[2]))) for r in con.execute(
+                    f"SELECT signal_id, COUNT(*), MAX(tick) FROM changes WHERE signal_id IN ({','.join('?' * len(chunk))}) AND tick>? AND tick<=? GROUP BY signal_id",
+                    (*chunk, a, b),
+                ))
+            active = sorted((s for s in sigs if s.signal_id in stats), key=lambda s: (-stats[s.signal_id][1], s.full_path))
+            idle = [s for s in sigs if s.signal_id not in stats]
+            shown = active[:limit]
+            end_vals = self._held_rows([s.signal_id for s in shown + idle[:limit]], b) if self.meta.get("ready_runs") == "1" else {}
+
+            def end_value(s: SignalRef) -> str | None:
+                row = end_vals.get(s.signal_id)
+                return display_value(row, s.width) if row is not None else None
+
+            last_tick = stats[active[0].signal_id][1] if active else None
+            data = {
+                "start_tick": a,
+                "end_tick": b,
+                "start_time": self.format_tick(a),
+                "end_time": self.format_tick(b),
+                "scope": scope,
+                "ignored": sorted(s.full_path for s in self._signals_by_ids(ignored_ids)),
+                "checked_signals": len(sigs),
+                "active_count": len(active),
+                "idle_count": len(idle),
+                "last_activity_tick": last_tick,
+                "last_activity_time": self.format_tick(last_tick) if last_tick is not None else None,
+                "most_recent": [
+                    {
+                        "signal": s.full_path,
+                        "change_count": stats[s.signal_id][0],
+                        "last_change_tick": stats[s.signal_id][1],
+                        "last_change_time": self.format_tick(stats[s.signal_id][1]),
+                        "end_value": end_value(s),
+                    }
+                    for s in shown
+                ],
+                "idle": [{"signal": s.full_path, "end_value": end_value(s)} for s in idle[:limit]],
+                "truncated": len(active) > limit or len(idle) > limit,
+            }
+            limitations = ["counts changes strictly after start and at or before end"]
+            if data["truncated"]:
+                limitations.append("lists truncated at limit")
+            if last_tick is None:
+                summary = f"No signal changed after {self.format_tick(a)} up to {self.format_tick(b)} ({len(sigs)} checked)"
+            else:
+                summary = f"{len(active)} of {len(sigs)} signal(s) changed; last activity at {self.format_tick(last_tick)} ({active[0].full_path}); {len(idle)} idle"
+            return ok("ok", summary, data, limitations=limitations)
+        except Exception as exc:
+            return fail("activity_failed", str(exc))
+
+    def _signals_by_ids(self, ids: Iterable[int]) -> list[SignalRef]:
+        ids = list(ids)
+        if not ids:
+            return []
+        return [SignalRef.from_row(r) for r in self.require().execute(
+            f"SELECT * FROM signals WHERE signal_id IN ({','.join('?' * len(ids))})", ids
+        )]
+
+    def state_transitions(self, signal: str, start: str | int | None = None, end: str | int | None = None, limit: int = 50) -> dict[str, Any]:
+        """Transition counts (from -> to) and time spent in each value: an FSM summary in one call."""
+        try:
+            for level in ("runs", "edges"):
+                need = self._index_required(level)
+                if need:
+                    return need
+            sig = self.get_signal(signal)
+            if isinstance(sig, dict):
+                return sig
+            window = self._window(start, end)
+            if isinstance(window, dict):
+                return window
+            a, b = window
+            limit = max(1, min(int(limit), 1000))
+            con = self.require()
+            trans = list(con.execute(
+                """
+                SELECT vf.raw_value AS f_raw, vf.int_value AS f_int, vt.raw_value AS t_raw, vt.int_value AS t_int,
+                       COUNT(*) AS n, MIN(e.tick) AS first_tick, MAX(e.tick) AS last_tick
+                FROM signal_edges e
+                JOIN values_interned vf ON vf.value_id=e.from_value_id
+                JOIN values_interned vt ON vt.value_id=e.to_value_id
+                WHERE e.signal_id=? AND e.tick BETWEEN ? AND ?
+                GROUP BY e.from_value_id, e.to_value_id
+                ORDER BY n DESC, first_tick
+                """,
+                (sig.signal_id, a, b),
+            ))
+            first = con.execute(
+                "SELECT start_tick FROM signal_runs WHERE signal_id=? AND start_tick<=? ORDER BY start_tick DESC LIMIT 1",
+                (sig.signal_id, a),
+            ).fetchone()
+            lo = int(first[0]) if first else a
+            dwell = list(con.execute(
+                """
+                SELECT v.raw_value, v.int_value, SUM(MIN(r.end_tick, ?) - MAX(r.start_tick, ?)) AS ticks, COUNT(*) AS visits
+                FROM signal_runs r JOIN values_interned v ON v.value_id=r.value_id
+                WHERE r.signal_id=? AND r.start_tick BETWEEN ? AND ?
+                GROUP BY r.value_id ORDER BY ticks DESC
+                """,
+                (b + 1, a, sig.signal_id, lo, b),
+            ))
+            span = b + 1 - a
+
+            def show(raw: str, int_value: Any) -> str:
+                if sig.width > 1:
+                    h = hex_of(int_value, sig.width)
+                    if h is not None:
+                        return h
+                return str(raw)
+
+            data = {
+                "signal": sig.full_path,
+                "width": sig.width,
+                "start_tick": a,
+                "end_tick": b,
+                "start_time": self.format_tick(a),
+                "end_time": self.format_tick(b),
+                "transition_count": sum(int(r["n"]) for r in trans),
+                "distinct_transitions": len(trans),
+                "transitions": [
+                    {
+                        "from": show(r["f_raw"], r["f_int"]),
+                        "to": show(r["t_raw"], r["t_int"]),
+                        "count": int(r["n"]),
+                        "first_time": self.format_tick(int(r["first_tick"])),
+                        "last_time": self.format_tick(int(r["last_tick"])),
+                        "first_tick": int(r["first_tick"]),
+                        "last_tick": int(r["last_tick"]),
+                    }
+                    for r in trans[:limit]
+                ],
+                "distinct_values": len(dwell),
+                "values": [
+                    {
+                        "value": show(r["raw_value"], r["int_value"]),
+                        "ticks": int(r["ticks"]),
+                        "fraction": round(int(r["ticks"]) / span, 6) if span else 0.0,
+                        "visits": int(r["visits"]),
+                    }
+                    for r in dwell[:limit]
+                ],
+                "truncated": len(trans) > limit or len(dwell) > limit,
+            }
+            limitations = ["values are end-of-timestep; a change and change-back inside one timestep is not a transition"]
+            if data["truncated"]:
+                limitations.append("lists truncated at limit")
+            return ok(
+                "ok",
+                f"{sig.full_path}: {data['transition_count']} transition(s) over {len(trans)} distinct from->to pair(s), {len(dwell)} distinct value(s)",
+                data,
+                limitations=limitations,
+            )
+        except Exception as exc:
+            return fail("state_transitions_failed", str(exc))
+
+    def pair_events(
+        self,
+        clock: str,
+        request: list[dict[str, Any]],
+        response: list[dict[str, Any]],
+        edge: str = "rise",
+        sample: str = "before",
+        start: str | int | None = None,
+        end: str | int | None = None,
+        request_id: str | None = None,
+        response_id: str | None = None,
+        allow_same_cycle: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Pair each request cycle with a later response cycle (in order, or in order per ID).
+
+        Reports latencies and, most usefully for hangs, requests that never got a response.
+        """
+        try:
+            if (request_id is None) != (response_id is None):
+                return fail("bad_query", "give both request_id and response_id, or neither")
+            limit = max(1, min(int(limit), 10000))
+            req = self._find_times(request, start, end, clock, edge, sample, _PAIR_MAX_EVENTS, [request_id] if request_id else None, max_limit=_PAIR_MAX_EVENTS)
+            if not req.get("ok"):
+                return req
+            rsp = self._find_times(response, start, end, clock, edge, sample, _PAIR_MAX_EVENTS, [response_id] if response_id else None, max_limit=_PAIR_MAX_EVENTS)
+            if not rsp.get("ok"):
+                return rsp
+            if req["data"].get("truncated") or rsp["data"].get("truncated"):
+                return fail("too_many_events", f"more than {_PAIR_MAX_EVENTS} request or response cycles; narrow start/end", {"max_events": _PAIR_MAX_EVENTS})
+            req_id_path = req["data"]["payload_signals"][0]["signal"] if request_id else None
+            rsp_id_path = rsp["data"]["payload_signals"][0]["signal"] if response_id else None
+
+            def key_of(match: dict[str, Any], path: str | None) -> int | str | None:
+                if path is None:
+                    return "*"
+                text = match["values"][path]
+                if text.startswith("0x"):
+                    return int(text, 16)
+                if text in ("0", "1"):
+                    return int(text)
+                return None  # x/z ID: cannot be matched
+
+            # One stream of (cycle, order, kind, match); order decides same-cycle handling.
+            events: list[tuple[int, int, str, dict[str, Any]]] = []
+            req_order, rsp_order = (0, 1) if allow_same_cycle else (1, 0)
+            events.extend((m["cycle_index"], req_order, "req", m) for m in req["data"]["matches"])
+            events.extend((m["cycle_index"], rsp_order, "rsp", m) for m in rsp["data"]["matches"])
+            events.sort(key=lambda e: (e[0], e[1]))
+            outstanding: dict[Any, deque[dict[str, Any]]] = {}
+            pairs: list[dict[str, Any]] = []
+            orphans: list[dict[str, Any]] = []
+            unkeyed_requests: list[dict[str, Any]] = []
+            for cycle, _order, kind, m in events:
+                if kind == "req":
+                    k = key_of(m, req_id_path)
+                    if k is None:
+                        unkeyed_requests.append(m)
+                    else:
+                        outstanding.setdefault(k, deque()).append(m)
+                    continue
+                k = key_of(m, rsp_id_path)
+                queue = outstanding.get(k) if k is not None else None
+                if not queue:
+                    orphans.append(m)
+                    continue
+                r = queue.popleft()
+                pairs.append({
+                    "id": (m["values"][rsp_id_path] if rsp_id_path else None),
+                    "request_cycle": r["cycle_index"],
+                    "response_cycle": cycle,
+                    "latency_cycles": cycle - r["cycle_index"],
+                    "request_time": r["edge_time"],
+                    "response_time": m["edge_time"],
+                    "latency_ticks": m["edge_tick"] - r["edge_tick"],
+                })
+            unmatched = sorted((m for q in outstanding.values() for m in q), key=lambda m: m["cycle_index"])
+            lat = sorted(p["latency_cycles"] for p in pairs)
+            stats = None
+            if lat:
+                mid = len(lat) // 2
+                median = lat[mid] if len(lat) % 2 else (lat[mid - 1] + lat[mid]) / 2
+                worst = max(pairs, key=lambda p: (p["latency_cycles"], -p["request_cycle"]))
+                stats = {"min": lat[0], "max": lat[-1], "mean": round(sum(lat) / len(lat), 3), "median": median, "worst": worst}
+
+            def brief(m: dict[str, Any], path: str | None) -> dict[str, Any]:
+                out = {"cycle_index": m["cycle_index"], "time": m["edge_time"]}
+                if path:
+                    out["id"] = m["values"][path]
+                return out
+
+            b_tick = int(rsp["data"]["end_tick"])
+            data = {
+                "clock": req["data"]["clock"],
+                "edge": edge,
+                "sample": sample,
+                "pairing": "in order per ID" if request_id else "in order",
+                "request_count": len(req["data"]["matches"]),
+                "response_count": len(rsp["data"]["matches"]),
+                "pair_count": len(pairs),
+                "latency_cycles": stats,
+                "pairs": pairs[:limit],
+                "unmatched_request_count": len(unmatched),
+                "unmatched_requests": [brief(m, req_id_path) for m in unmatched[:limit]],
+                "orphan_response_count": len(orphans),
+                "orphan_responses": [brief(m, rsp_id_path) for m in orphans[:limit]],
+                "unknown_id_request_count": len(unkeyed_requests),
+                "window_ends_before_sim_end": b_tick < int(self.meta.get("max_tick", 0)),
+                "truncated": len(pairs) > limit or len(unmatched) > limit or len(orphans) > limit,
+            }
+            limitations = [
+                "pairing assumes responses return in request order" + (" within each ID" if request_id else "") + "; out-of-order protocols need request_id/response_id",
+                "same-cycle responses " + ("may" if allow_same_cycle else "may not") + " complete a request issued that cycle",
+            ]
+            if data["window_ends_before_sim_end"] and unmatched:
+                limitations.append("window ends before the simulation does; unmatched requests may complete later")
+            if data["truncated"]:
+                limitations.append("lists truncated at limit")
+            summary = f"{len(pairs)} request/response pair(s)"
+            if stats:
+                summary += f", latency {stats['min']}..{stats['max']} cycles (mean {stats['mean']})"
+            summary += f"; {len(unmatched)} unmatched request(s), {len(orphans)} orphan response(s)"
+            if unkeyed_requests:
+                summary += f", {len(unkeyed_requests)} request(s) with x/z ID"
+            return ok("ok", summary, data, limitations=limitations)
+        except Exception as exc:
+            return fail("pair_events_failed", str(exc))
