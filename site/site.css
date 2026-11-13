@@ -1,10 +1,11 @@
 /* Hallmark · shape: Conversational FAQ (draw swap: pricing table becomes a with/without table, WaveQ is free) · genre: modern-minimal · theme: Cobalt (deal 1/3, seed simple-minimalistic-github-pages-c9d1·cdde2efa·2026-11-12·r0) · job: sign up · draw: 255327
- * hero: Stage · nav: edge-aligned · footer: index columns · imagery: none, the product's real output in graphite panes and diagrams drawn from examples/sample.vcd · signature: raw VCD lines joined by hairline elbows to the exact JSON answer they become
+ * hero: Stage · nav: edge-aligned · footer: index columns · imagery: none, the product's real output in graphite panes and diagrams drawn from examples/sample.vcd · signature: raw VCD lines joined by hairline elbows to the exact JSON answer they become, with the same lines drawn as a live waveform whose cursor lands at 16 ns
  * axes: light/grotesk-sans/cool · posture: restrained · contrast: pass · fold: pass · v2.0.0 */
 /* Hallmark · pre-emit critique: P4 H4 E4 S5 R4 V4 · weakest: P, the page could read as a feature tour; every head is a question a sceptical engineer would ask and every answer shows real output */
 /* Hallmark · dismissed 58 · page total 565 counts 163 words of real tool output in code panes and 71 axis and lane labels in the sample.vcd diagrams; the prose is 333 words */
 /* Hallmark · dismissed 58 · the 89-word screen at y 3650 is the install terminal and the client config, code a reader copies, with 31 words of prose */
 /* Hallmark · hero-review: fix · 5 findings · 4 resolved 1 partial (the phone first screen shows the matched lines and the answer pane top; the full answer sits just under the fold at 812) · finish-review: skipped at user request */
+/* Hallmark · redesign: polish (hero, 2026-11-14) · added the live waveform pane (diagram:scope, built from sample.vcd by build_diagrams.py) and one 9 s loop with a pause key; nothing removed · sloplint 0 FAIL 0 WARN, kept 11/11 links 7/7 hooks · finish-review: skipped, scoped hero change */
 @import url("./tokens.css");
 @import url("./base.css");
 
@@ -65,7 +66,8 @@ code, pre { font-family: var(--font-outlier); }
 .pane__body { margin: 0; padding: var(--space-sm) 0; font-size: var(--text-xs); line-height: 24px; overflow-x: auto; white-space: normal; }
 .pane__body code { display: block; white-space: normal; }
 .pane__body span { display: block; padding: 0 var(--space-md); white-space: pre; }
-.pane__body .hit { background: var(--color-graphite-2); color: var(--color-graphite-ink); box-shadow: inset 2px 0 0 var(--color-accent-2); }
+.pane__body .hit { position: relative; isolation: isolate; color: var(--color-graphite-ink); }
+.pane__body .hit::before { content: ""; position: absolute; inset: 0; z-index: -1; background: var(--color-graphite-2); box-shadow: inset 2px 0 0 var(--color-accent-2); }
 .pane__body .skipline { color: var(--color-graphite-muted); }
 .mapping__links { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
 .mapping__links path { fill: none; stroke: var(--color-accent); stroke-width: 1.25; }
@@ -73,11 +75,59 @@ code, pre { font-family: var(--font-outlier); }
 .mapping figcaption { grid-column: 1 / -1; margin-top: var(--space-md); font-size: var(--text-sm); color: var(--color-ink-2); max-width: none; text-wrap: balance; }
 .mapping figcaption code { font-size: var(--text-xs); padding: 0 var(--space-2xs); background: var(--color-paper-3); border-radius: var(--radius-input); }
 
+/* the live waveform: the same lines drawn, a cursor that lands at 16 ns, the run of valid it lands in */
+.mapping { grid-template-rows: auto auto; row-gap: var(--space-md); }
+.mapping > .pane:first-child { grid-row: 1 / span 2; }
+.mapping .pane--scope { grid-column: 3; grid-row: 1; align-self: end; }
+.mapping .pane--answer { grid-row: 2; align-self: start; }
+.pane--scope .pane__head { justify-content: space-between; gap: var(--space-md); padding-block: var(--space-2xs); }
+.live-toggle { min-height: 32px; min-width: 56px; padding: 0 var(--space-sm); border: var(--rule-hair) solid var(--color-graphite-glyph-2); border-radius: var(--radius-input); background: transparent; color: var(--color-graphite-ink); font: 500 var(--text-xs)/1 var(--font-display); cursor: pointer; transition: border-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out); }
+.live-toggle:hover { border-color: var(--color-accent-2); color: var(--color-accent-2); }
+.live-toggle:active { transform: translateY(1px); }
+.live-toggle:focus-visible { outline: 2px solid var(--color-accent-2); outline-offset: 2px; }
+.live-toggle[aria-pressed="true"] { border-color: var(--color-accent-2); color: var(--color-accent-2); }
+.live-toggle:disabled { opacity: 0.55; cursor: not-allowed; }
+html:not(.js) .live-toggle { display: none; }
+.scope__plot { padding: var(--space-sm) var(--space-md) 0; }
+.diagram.scope text { fill: var(--color-graphite-muted); }
+.diagram.scope .lane { fill: var(--color-graphite-ink); font-weight: 500; }
+.diagram.scope .tick { fill: var(--color-graphite-muted); }
+.diagram.scope .axis { stroke: var(--color-graphite-glyph-2); }
+.diagram.scope .grid { stroke: var(--color-graphite-glyph-1); }
+.diagram.scope .wave { stroke: var(--color-graphite-ink); stroke-width: 1.5; }
+.diagram.scope .wave--hit { stroke: var(--color-accent-2); stroke-width: 2; }
+.diagram.scope .bus { fill: var(--color-graphite-2); stroke: var(--color-graphite-ink); stroke-width: 1.25; }
+.diagram.scope .bus-label { fill: var(--color-graphite-ink); }
+.diagram.scope .cursor { stroke: var(--color-accent-2); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.diagram.scope .cursor-label { fill: var(--color-accent-2); font-weight: 500; }
+.scope__run { fill: color-mix(in oklab, var(--color-accent-2) 16%, transparent); stroke: var(--color-accent-2); stroke-width: 1; transform-box: fill-box; transform-origin: left center; }
+.scope__readout { padding: var(--space-xs) var(--space-md) var(--space-md); font-size: var(--text-sm); color: var(--color-graphite-ink); }
+
+/* one 9 s loop, transform and opacity only; script turns it on, the key and an off-screen hero pause it */
+@keyframes scope-cursor {
+  0% { transform: translateX(var(--from)); opacity: 0; }
+  5% { transform: translateX(var(--from)); opacity: 1; }
+  28%, 88% { transform: translateX(0); opacity: 1; }
+  96%, 100% { transform: translateX(0); opacity: 0; }
+}
+@keyframes scope-run { 0%, 29% { transform: scaleX(0); opacity: 0; } 38%, 88% { transform: scaleX(1); opacity: 1; } 96%, 100% { transform: scaleX(1); opacity: 0; } }
+@keyframes scope-show { 0%, 38% { transform: translateY(4px); opacity: 0; } 44%, 88% { transform: translateY(0); opacity: 1; } 96%, 100% { transform: translateY(0); opacity: 0; } }
+@keyframes scope-glow { 0%, 44% { opacity: 0; } 49%, 88% { opacity: 1; } 96%, 100% { opacity: 0; } }
+@keyframes scope-glow-late { 0%, 50% { opacity: 0; } 56%, 88% { opacity: 1; } 96%, 100% { opacity: 0; } }
+.mapping.is-live .scope__cursor { animation: scope-cursor 9s var(--ease-in-out) infinite; }
+.mapping.is-live .scope__run { animation: scope-run 9s var(--ease-out) infinite; }
+.mapping.is-live .scope__readout, .mapping.is-live .scope__stamp { animation: scope-show 9s var(--ease-out) infinite; }
+.mapping.is-live > .pane:first-child .hit::before { animation: scope-glow 9s linear infinite; }
+.mapping.is-live .pane--answer .hit::before, .mapping.is-live .mapping__links { animation: scope-glow-late 9s linear infinite; }
+.mapping.is-paused *, .mapping.is-paused *::before { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) { .mapping .scope__cursor, .mapping .scope__run, .mapping .scope__readout, .mapping .scope__stamp, .mapping .hit::before, .mapping .mapping__links { animation: none; } .live-toggle { display: none; } }
+
 @media (max-width: 60rem) {
   .hero { min-height: 0; padding-block: var(--space-xl) var(--space-2xl); }
   .hero__grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); }
   .mapping { grid-template-columns: minmax(0, 1fr); gap: var(--space-md); }
-  .mapping .pane, .mapping .pane--answer { grid-column: 1; grid-row: auto; }
+  .mapping .pane, .mapping > .pane:first-child, .mapping .pane--scope, .mapping .pane--answer { grid-column: 1; grid-row: auto; align-self: auto; }
+  .mapping .pane--scope { order: -1; }
   .mapping__links { display: none; }
   .mapping .pane__body span:not(.hit):not(.ctx) { display: none; }
   .mapping .pane__body { padding-block: var(--space-xs); }

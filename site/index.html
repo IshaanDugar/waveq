@@ -43,7 +43,7 @@
       </div>
     </div>
 
-    <figure class="mapping" data-mapping aria-label="Raw VCD lines from sample.vcd mapped to the JSON answer WaveQ returns for value_at tb.valid at 16 ns">
+    <figure class="mapping" data-mapping data-live aria-label="Raw VCD lines from sample.vcd mapped to the JSON answer WaveQ returns for value_at tb.valid at 16 ns">
       <div class="pane graphite cut">
         <div class="pane__head"><code>sample.vcd</code></div>
 <pre class="pane__body"><code><span>$var wire 1 ! clk $end</span>
@@ -70,6 +70,43 @@
       </div>
 
       <svg class="mapping__links" aria-hidden="true" focusable="false"></svg>
+
+      <div class="pane graphite cut pane--scope">
+        <div class="pane__head"><span><code>sample.vcd</code>, drawn</span><button class="live-toggle" type="button" aria-pressed="false" data-live-toggle>Pause</button></div>
+        <div class="scope__plot">
+<!-- diagram:scope -->
+<svg class="diagram scope" viewBox="0 0 440 148" role="img" aria-label="Waveform of sample.vcd from 0 to 50 ns with a cursor at 16 ns: valid is 1 there, in the run from 15 to 40 ns.">
+<line class="axis" x1="56" y1="122" x2="428" y2="122"/>
+<line class="grid" x1="56.0" y1="4" x2="56.0" y2="122"/>
+<text class="tick" x="56.0" y="140">0</text>
+<line class="grid" x1="130.4" y1="4" x2="130.4" y2="122"/>
+<text class="tick" x="130.4" y="140">10</text>
+<line class="grid" x1="204.8" y1="4" x2="204.8" y2="122"/>
+<text class="tick" x="204.8" y="140">20</text>
+<line class="grid" x1="279.2" y1="4" x2="279.2" y2="122"/>
+<text class="tick" x="279.2" y="140">30</text>
+<line class="grid" x1="353.6" y1="4" x2="353.6" y2="122"/>
+<text class="tick" x="353.6" y="140">40</text>
+<line class="grid" x1="428.0" y1="4" x2="428.0" y2="122"/>
+<text class="tick" x="428.0" y="140">50 ns</text>
+<rect class="scope__run" x="167.6" y="34" width="186.0" height="24" rx="3"/>
+<text class="lane" x="0" y="22.0">clk</text>
+<path class="wave" d="M56.0 26 H93.2 V10 H130.4 V26 H167.6 V10 H204.8 V26 H242.0 V10 H279.2 V26 H316.4 V10 H353.6 V26 H390.8 V10 H428.0 V26 H428.0"/>
+<text class="lane" x="0" y="50.0">valid</text>
+<path class="wave wave--hit" d="M56.0 54 H167.6 V38 H353.6 V54 H428.0"/>
+<text class="lane" x="0" y="78.0">ready</text>
+<path class="wave" d="M56.0 82 H204.8 V66 H353.6 V82 H428.0"/>
+<text class="lane" x="0" y="106.0">data</text>
+<path class="bus" d="M56.0 102.0 L56.0 94 H163.6 L167.6 102.0 L163.6 110 H56.0 Z"/>
+<text class="bus-label" x="111.8" y="102.0">00</text>
+<path class="bus" d="M167.6 102.0 L171.6 94 H428.0 L428.0 102.0 L428.0 110 H171.6 Z"/>
+<text class="bus-label" x="297.8" y="102.0">A5</text>
+<g class="scope__cursor" style="--from: -119.04px"><line class="cursor" x1="175.04" y1="2" x2="175.04" y2="122"/></g><text class="cursor-label scope__stamp" text-anchor="middle" x="175.04" y="138">16 ns</text>
+</svg>
+<!-- /diagram:scope -->
+        </div>
+        <p class="scope__readout">valid is <b class="token">1</b> from 15 to 40 ns</p>
+      </div>
 
       <div class="pane graphite cut pane--answer">
         <div class="pane__head"><code>value_at("tb.valid", "16ns")</code></div>
@@ -439,6 +476,24 @@ cwd = "/path/to/waveq"</code></pre>
       });
     });
     select(tabs.find((t) => t.getAttribute('aria-selected') === 'true') || tabs[0], false);
+  });
+
+  // The hero loop: on only with script and motion allowed; paused by its key or when off screen
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)');
+  document.querySelectorAll('[data-live]').forEach((fig) => {
+    const key = fig.querySelector('[data-live-toggle]');
+    let held = false, hidden = false;
+    const sync = () => {
+      fig.classList.toggle('is-live', !reduce.matches);
+      fig.classList.toggle('is-paused', held || hidden);
+      if (key) { key.hidden = reduce.matches; key.setAttribute('aria-pressed', held); key.textContent = held ? 'Play' : 'Pause'; }
+    };
+    key && key.addEventListener('click', () => { held = !held; sync(); });
+    reduce.addEventListener('change', sync);
+    if ('IntersectionObserver' in window) {
+      new IntersectionObserver(([entry]) => { hidden = !entry.isIntersecting; sync(); }).observe(fig);
+    }
+    sync();
   });
 
   const figs = document.querySelectorAll('[data-mapping]');

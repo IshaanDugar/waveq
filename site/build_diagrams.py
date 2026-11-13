@@ -194,12 +194,48 @@ def find_figure(e: WaveQEngine) -> str:
     )
 
 
+def scope_figure(e: WaveQEngine) -> str:
+    """The hero's live waveform: four lanes, a cursor that travels to 16 ns, and the run of valid it lands in."""
+    W, LABEL, PAD, LANE_H, GAP, T = 440, 56, 12, 16, 12, 16
+    x = Axis(LABEL, W - PAD, 0, 50)
+    lanes = [("clk", "tb.clk"), ("valid", "tb.valid"), ("ready", "tb.ready"), ("data", "tb.data")]
+    top0 = 10
+    held = e.value_at("tb.valid", T)
+    assert held["ok"], held
+    run_a, run_b = held["data"]["held_from_tick"], held["data"]["held_until_tick_exclusive"]
+    body, run = [], ""
+    for i, (name, sig) in enumerate(lanes):
+        top = top0 + i * (LANE_H + GAP)
+        body.append(lane_label(name, top + LANE_H / 2 + 4))
+        ch = changes(e, sig)
+        if name == "data":
+            body.append(bus_shapes(ch, x, top, LANE_H, 50))
+        else:
+            hit = " wave--hit" if sig == "tb.valid" else ""
+            body.append(f'<path class="wave{hit}" d="{bit_path(ch, x, top, LANE_H, 50)}"/>')
+        if sig == "tb.valid":
+            run = (f'<rect class="scope__run" x="{x(run_a)}" y="{top - 4}" width="{round(x(run_b) - x(run_a), 2)}" '
+                   f'height="{LANE_H + 8}" rx="3"/>')
+    axis_y = top0 + len(lanes) * (LANE_H + GAP) - GAP + 12
+    H = axis_y + 26
+    cursor = (
+        f'<g class="scope__cursor" style="--from: {round(x(0) - x(T), 2)}px">'
+        f'<line class="cursor" x1="{x(T)}" y1="2" x2="{x(T)}" y2="{axis_y}"/></g>'
+        f'<text class="cursor-label scope__stamp" text-anchor="middle" x="{x(T)}" y="{axis_y + 16}">{T} ns</text>'
+    )
+    return (
+        f'<svg class="diagram scope" viewBox="0 0 {W} {H}" role="img" aria-label="Waveform of sample.vcd from 0 to 50 ns with a cursor at {T} ns: '
+        f'valid is 1 there, in the run from {run_a} to {run_b} ns.">\n'
+        + "\n".join([time_axis(x, axis_y, 10, top0 - 6), run, *body, cursor]) + "\n</svg>"
+    )
+
+
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="waveq-site-"))
     e = WaveQEngine()
     try:
         assert e.configure(str(VCD), cache_dir=str(tmp), rebuild=True)["ok"]
-        figures = {"vcd": vcd_figure(e), "index": index_figure(e), "find": find_figure(e)}
+        figures = {"scope": scope_figure(e), "vcd": vcd_figure(e), "index": index_figure(e), "find": find_figure(e)}
     finally:
         e.close()
         shutil.rmtree(tmp, ignore_errors=True)
