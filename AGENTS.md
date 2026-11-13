@@ -5,6 +5,7 @@ Use WaveQ for exact VCD observations, not for protocol proof.
 Preferred flow:
 
 1. Call `configure_waveform` once for the target `.vcd` or `.vcd.gz`. Pass `index="full"` when you will run value queries, so a large file is query-ready in one call.
+   On a big dump where you only need a few signals, configure with `index="metadata"`, then `build_index(signals=[...])`: only those are indexed, and `signal_not_indexed` tells you to add more.
 2. Call `waveform_info` to learn the timescale and range.
 3. Use `resolve_signals` before querying approximate or leaf-only names.
 4. Prefer `values_at`, `changes_many`, and `window_digest` over many single-signal calls.

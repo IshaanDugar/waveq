@@ -970,6 +970,111 @@ class FirstDivergenceTests(unittest.TestCase):
         self.assertTrue(bad["isError"], bad)
 
 
+class SubsetIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = make_tmp_dir()
+        self.engine = WaveQEngine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def subset(self, vcd: pathlib.Path, signals: list[str], cache: str = "cache") -> dict:
+        r = self.engine.configure(str(vcd), cache_dir=str(self.tmp / cache), rebuild=True, index="metadata")
+        self.assertTrue(r["ok"], r)
+        r = self.engine.build_index(level="full", signals=signals)
+        self.assertTrue(r["ok"], r)
+        return r
+
+    def rows(self, db_path: str, full_path: str) -> dict[str, list]:
+        con = sqlite3.connect(db_path)
+        try:
+            sid = con.execute("SELECT signal_id FROM signals WHERE full_path=?", (full_path,)).fetchone()[0]
+            return {
+                "changes": con.execute("SELECT c.tick, v.raw_value FROM changes c JOIN values_interned v USING(value_id) WHERE signal_id=? ORDER BY tick, ordinal", (sid,)).fetchall(),
+                "runs": con.execute("SELECT r.start_tick, r.end_tick, v.raw_value FROM signal_runs r JOIN values_interned v USING(value_id) WHERE signal_id=? ORDER BY start_tick", (sid,)).fetchall(),
+                "edges": con.execute("SELECT e.tick, e.edge_kind FROM signal_edges e WHERE signal_id=? ORDER BY tick", (sid,)).fetchall(),
+            }
+        finally:
+            con.close()
+
+    def test_subset_rows_match_full_build(self) -> None:
+        sub = self.subset(FIXTURES / "sample.vcd", ["tb.valid", "data"])
+        self.assertTrue(sub["data"]["index_subset"])
+        self.assertEqual(sub["data"]["indexed_signal_count"], 2)
+        sub_db = sub["data"]["db_path"]
+        full = WaveQEngine()
+        try:
+            r = full.configure(str(FIXTURES / "sample.vcd"), cache_dir=str(self.tmp / "full"), rebuild=True, index="full")
+            for path in ("tb.valid", "tb.data [7:0]"):
+                self.assertEqual(self.rows(sub_db, path), self.rows(r["data"]["db_path"], path), path)
+            for t in range(0, 51, 7):
+                self.assertEqual(self.engine.value_at("tb.valid", t)["data"]["value"], full.value_at("tb.valid", t)["data"]["value"])
+        finally:
+            full.close()
+
+    def test_queries_outside_subset_fail(self) -> None:
+        self.subset(FIXTURES / "sample.vcd", ["tb.valid"])
+        r = self.engine.value_at("tb.ready", "16ns")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["status"], "signal_not_indexed")
+        self.assertEqual(self.engine.values_at(["tb.valid", "tb.ready"], 16)["status"], "partial_failure")
+        self.assertEqual(self.engine.find_times([{"signal": "tb.ready", "value": "1"}])["status"], "bad_condition")
+        self.assertEqual(self.engine.define_clock("tb.clk")["status"], "signal_not_indexed")
+        found = {m["full_path"]: m["indexed"] for m in self.engine.resolve_signals("valid")["data"]["matches"]}
+        self.assertTrue(found["tb.valid"])
+        info = self.engine.info()["data"]
+        self.assertTrue(info["index_subset"])
+        self.assertEqual(info["indexed_signal_count"], 1)
+
+    def test_scope_tools_skip_and_say_so(self) -> None:
+        self.subset(FIXTURES / "sample.vcd", ["tb.valid", "tb.ready"])
+        r = self.engine.activity()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["checked_signals"], 2)
+        self.assertTrue(any("not in this cache's signal subset" in l for l in r["limitations"]))
+        x = self.engine.x_report(0)
+        self.assertTrue(any("not in this cache's signal subset" in l for l in x["limitations"]))
+        self.assertEqual(x["data"]["checked_signals"], 2)
+
+    def test_subset_grows_and_full_request_rebuilds(self) -> None:
+        self.subset(FIXTURES / "sample.vcd", ["tb.valid"])
+        grown = self.engine.build_index(level="full", signals=["tb.ready"])
+        self.assertFalse(grown["data"]["cache_reused"])
+        self.assertEqual(grown["data"]["indexed_signal_count"], 2)
+        self.assertTrue(self.engine.value_at("tb.valid", 16)["ok"])
+        again = self.engine.build_index(level="full", signals=["tb.valid"])
+        self.assertTrue(again["data"]["cache_reused"])
+        full = self.engine.build_index(level="full")
+        self.assertFalse(full["data"]["index_subset"])
+        self.assertTrue(self.engine.value_at("tb.clk", 5)["ok"])
+        # A full cache already covers any subset request.
+        reuse = self.engine.build_index(level="full", signals=["tb.valid"])
+        self.assertTrue(reuse["data"]["cache_reused"])
+        self.assertFalse(reuse["data"]["index_subset"])
+
+    def test_configure_full_replaces_subset(self) -> None:
+        self.subset(FIXTURES / "sample.vcd", ["tb.valid"])
+        auto = self.engine.configure(str(FIXTURES / "sample.vcd"), cache_dir=str(self.tmp / "cache"))
+        self.assertTrue(auto["data"]["cache_reused"])
+        self.assertEqual(self.engine.value_at("tb.ready", 16)["status"], "signal_not_indexed")
+        full = self.engine.configure(str(FIXTURES / "sample.vcd"), cache_dir=str(self.tmp / "cache"), index="full")
+        self.assertTrue(full["ok"], full)
+        self.assertTrue(self.engine.value_at("tb.ready", 16)["ok"])
+
+    def test_alias_outside_subset_is_not_indexed(self) -> None:
+        self.subset(FIXTURES / "aliases_and_xz.vcd", ["tb.a"])
+        self.assertEqual(self.engine.value_at("tb.alias_a", 1)["status"], "signal_not_indexed")
+        edges = self.engine.edges("tb.a")
+        self.assertEqual([e["kind"] for e in edges["data"]["edges"]], ["x_exit", "fall"])
+
+    def test_bad_subset_names_fail(self) -> None:
+        self.engine.configure(str(FIXTURES / "sample.vcd"), cache_dir=str(self.tmp / "cache"), rebuild=True, index="metadata")
+        r = self.engine.build_index(level="full", signals=["tb.valid", "tb.nope"])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["status"], "bad_signals")
+
+
 class MCPTests(unittest.TestCase):
     def call_tool(self, name: str, arguments: dict[str, object], msg_id: int = 100) -> dict[str, object]:
         resp = handle_message({"jsonrpc": "2.0", "id": msg_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})

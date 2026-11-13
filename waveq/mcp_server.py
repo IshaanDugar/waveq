@@ -80,12 +80,13 @@ TOOLS: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str,
         lambda a: ENGINE.index_status(a.get("vcd_path"), a.get("cache_dir")),
     ),
     "build_index": (
-        "Explicitly build expensive indexes. Levels: changes, runs, edges, full.",
+        "Explicitly build expensive indexes. Levels: changes, runs, edges, full. Pass signals to index only those (much faster on big dumps); "
+        "queries on other signals then fail with signal_not_indexed, and a later call with more signals grows the subset.",
         _schema({
             "vcd_path": _str("Optional path to .vcd or .vcd.gz"),
             "cache_dir": _str("Optional cache directory"),
             "level": _enum("Index level; default full", ("changes", "runs", "edges", "full")),
-            "signals": _arr("Optional signal subset; currently unsupported"),
+            "signals": _arr("Optional signals to index (names resolve like queries); omit for every signal"),
             "rebuild": _bool("Force rebuild", False),
         }),
         lambda a: ENGINE.build_index(a.get("vcd_path"), a.get("cache_dir"), a.get("level", "full"), a.get("signals"), bool(a.get("rebuild", False))),

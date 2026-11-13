@@ -104,7 +104,7 @@ Recommended agent workflow:
 |------|---------|
 | `configure_waveform` | Load VCD metadata and cache |
 | `index_status` | Check which index levels are ready |
-| `build_index` | Build `changes`, `runs`, `edges`, or `full` |
+| `build_index` | Build `changes`, `runs`, `edges`, or `full`, for every signal or only the `signals` you name |
 | `waveform_info` | Timescale, signal count, time range |
 | `resolve_signals` | Match approximate names to exact paths |
 | `value_at` / `values_at` | Signal value(s) at one time |
@@ -185,7 +185,7 @@ Large files stay metadata-only at configure time — you pay for indexing only w
 waveq info <vcd>
 waveq configure <vcd>
 waveq index-status <vcd>
-waveq build-index <vcd> --level full
+waveq build-index <vcd> --level full [--signals tb.clk tb.valid tb.data]
 waveq resolve <vcd> <query>
 waveq value <vcd> <signal> <time>
 waveq values <vcd> <time> <signal> [...]

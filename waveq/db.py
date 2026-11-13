@@ -48,6 +48,7 @@ class BuildStats:
     size_class: str = "small"
     built_level: str = "full"
     reused: bool = False
+    indexed_signals: int | None = None  # None: every signal is indexed
 
 
 def size_class_for_bytes(size: int) -> str:
@@ -653,7 +654,36 @@ def build_metadata_database(vcd_path: str | Path, cache_dir: str | Path | None =
     )
 
 
-def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *, rebuild: bool = False, level: str = "full") -> BuildStats:
+def indexed_subset(db_path: str | Path) -> set[str] | None:
+    """Full paths a subset cache indexed, or None when the cache indexes every signal (or is unreadable)."""
+    try:
+        con = connect(db_path, readonly=True)
+        try:
+            meta = _meta_dict(con)
+            if meta.get("index_subset") != "1":
+                return None
+            return {r[0] for r in con.execute("SELECT s.full_path FROM indexed_signals i JOIN signals s ON s.signal_id=i.signal_id")}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def build_database(
+    vcd_path: str | Path,
+    cache_dir: str | Path | None = None,
+    *,
+    rebuild: bool = False,
+    level: str = "full",
+    signals: Iterable[str] | None = None,
+) -> BuildStats:
+    """Build (or reuse) the indexed cache.
+
+    signals: exact full paths to index. The whole dump is still parsed, but only these signals'
+    changes, runs and edges are stored, and the cache records the subset so queries on any other
+    signal fail instead of reading as never-changing. An existing cache is reused when it covers the
+    request; asking for more signals rebuilds with the union of old and new.
+    """
     if level not in {"changes", "runs", "edges", "full"}:
         raise ValueError("index level must be one of: changes, runs, edges, full")
     build_runs = level in {"runs", "full"}
@@ -672,7 +702,12 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     if level in {"edges", "full"}:
         requested_ready.append("edges")
     status = cache_status(source, cache_dir)
-    if not rebuild and status.get("cache_valid") and all(x in status.get("ready_levels", []) for x in requested_ready):
+    wanted: set[str] | None = set(signals) if signals else None
+    existing_subset = indexed_subset(db_path) if status.get("cache_valid") else None
+    covers = existing_subset is None or (wanted is not None and wanted <= existing_subset)
+    if wanted is not None and existing_subset is not None and not covers:
+        wanted |= existing_subset
+    if not rebuild and status.get("cache_valid") and covers and all(x in status.get("ready_levels", []) for x in requested_ready):
         meta = status.get("metadata", {})
         return BuildStats(
             db_path=db_path,
@@ -687,6 +722,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
             size_class=size_class_for_bytes(source.stat().st_size),
             built_level=level,
             reused=True,
+            indexed_signals=len(existing_subset) if existing_subset is not None else None,
         )
 
     carried_clocks = _existing_clock_defs(db_path) if build_edges else []
@@ -825,7 +861,16 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
 
     with _open_text(source) as fh:
         timescale, signal_defs = _parse_header_stream(fh)
-        for sig in signal_defs:
+        if wanted is not None:
+            unknown = sorted(wanted - {sig.full_path for sig in signal_defs})
+            if unknown:
+                con.close()
+                tmp_path.unlink(missing_ok=True)
+                raise ValueError(f"signals not in the VCD header: {', '.join(unknown[:20])}")
+        indexed_defs = [sig for sig in signal_defs if wanted is None or sig.full_path in wanted]
+        # Only indexed signals are wired to their id codes, so every other value change is skipped
+        # at the first dictionary lookup.
+        for sig in indexed_defs:
             id_to_signals.setdefault(sig.id_code, []).append(sig)
             current_value[sig.signal_id] = "x"
             current_run_start[sig.signal_id] = 0
@@ -870,7 +915,7 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
     flush_pending(current_tick)
     end_tick = max_tick + 1
     if build_runs:
-        for sig in signal_defs:
+        for sig in indexed_defs:
             start_tick = current_run_start.get(sig.signal_id, 0)
             raw = current_value.get(sig.signal_id, "x")
             if end_tick > start_tick:
@@ -889,7 +934,12 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         "edge_count": str(edge_count),
         "min_tick": str(min_tick if min_tick is not None else 0),
         "max_tick": str(max_tick),
+        "index_subset": "1" if wanted is not None else "0",
+        "indexed_signal_count": str(len(indexed_defs)),
     })
+    if wanted is not None:
+        con.execute("CREATE TABLE indexed_signals (signal_id INTEGER PRIMARY KEY)")
+        con.executemany("INSERT INTO indexed_signals(signal_id) VALUES(?)", ((sig.signal_id,) for sig in indexed_defs))
     _insert_meta(con, meta)
     _create_indexes(con, level)
     # Keep clocks defined against the previous cache; re-derive them from the new edges.
@@ -913,4 +963,5 @@ def build_database(vcd_path: str | Path, cache_dir: str | Path | None = None, *,
         size_class=size_class_for_bytes(source_stat.st_size),
         built_level=level,
         reused=False,
+        indexed_signals=len(indexed_defs) if wanted is not None else None,
     )

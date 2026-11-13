@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `value_at` / `values_at` results include a `hex` field for fully known vectors
 - `WAVEQ_CACHE_DIR` environment variable; the default cache moves to the per-user cache directory when the VCD's folder is synced (OneDrive, Dropbox, Google Drive, iCloud) or read-only
 - CLI commands `scopes`, `xreport`, `activity`, `transitions`, `pair`; `find --payload`; `--index` on every command that configures
+- `build_index` `signals`: index only the named signals. The whole dump is still parsed but only their rows are stored (6x faster build, 12x smaller cache for 4 of 128 signals in the benchmark dump); queries on other signals fail with `signal_not_indexed`, scope-wide tools say how many signals they skipped, and asking for more signals rebuilds with the union
 - `first_divergence` MCP tool and `waveq diff` CLI command: compare the configured waveform with a second VCD and report the first time they differ, on which signals, and the values just before
 
 ### Performance

@@ -138,6 +138,7 @@ class WaveQEngine:
         # Per-cache memo: resolved names and defined clocks. Reset whenever the cache is (re)opened.
         self._sig_cache: dict[str, SignalRef] = {}
         self._clock_ok: set[tuple[int, str]] = set()
+        self._indexed: set[int] | None = None
 
     def close(self) -> None:
         if self.con is not None:
@@ -155,6 +156,7 @@ class WaveQEngine:
         self.meta = {}
         self._sig_cache = {}
         self._clock_ok = set()
+        self._indexed = None
 
     def _open_cache(self, db_path: Path, vcd_path: str, cache_dir: str | None = None) -> None:
         self.close()
@@ -165,6 +167,8 @@ class WaveQEngine:
         self.meta = {r["key"]: r["value"] for r in self.con.execute("SELECT key, value FROM meta")}
         if self.meta.get("ready_metadata") == "1":
             self.timescale = Timescale(int(self.meta["timescale_number"]), self.meta["timescale_unit"])
+        if self.meta.get("index_subset") == "1":
+            self._indexed = {int(r[0]) for r in self.con.execute("SELECT signal_id FROM indexed_signals")}
 
     def _ready_levels(self) -> list[str]:
         return [level for level in ("metadata", "changes", "runs", "edges") if self.meta.get(f"ready_{level}") == "1"]
@@ -208,8 +212,9 @@ class WaveQEngine:
             prior = cache_status(source, cache_dir)
             want_full = index == "full" or (index == "auto" and size_class == "small")
             prior_ready = prior.get("ready_levels", [])
+            prior_subset = prior.get("metadata", {}).get("index_subset") == "1"
             if not rebuild and prior.get("cache_valid") and "metadata" in prior_ready and (
-                not want_full or all(level in prior_ready for level in ("changes", "runs", "edges"))
+                not want_full or (all(level in prior_ready for level in ("changes", "runs", "edges")) and not (index == "full" and prior_subset))
             ):
                 stats = BuildStats(
                     db_path=cache_path_for(source, cache_dir),
@@ -267,14 +272,28 @@ class WaveQEngine:
     def build_index(self, vcd_path: str | None = None, cache_dir: str | None = None, level: str = "full", signals: list[str] | None = None, rebuild: bool = False) -> dict[str, Any]:
         started = time.perf_counter()
         try:
-            if signals:
-                return fail("unsupported", "signal-subset indexing is not supported yet; build the requested level for the whole VCD", {"signals": signals})
             target = str(Path(vcd_path).expanduser().resolve()) if vcd_path else (str(self.vcd_path) if self.vcd_path else None)
             use_cache_dir = cache_dir if cache_dir is not None else self.cache_dir
             if target is None:
                 return fail("not_configured", "no waveform configured and no vcd_path supplied")
+            subset: list[str] | None = None
+            if signals:
+                # Names resolve against the header (metadata), exactly as queries resolve them.
+                if self.vcd_path is None or str(self.vcd_path) != target or self.meta.get("ready_metadata") != "1":
+                    meta_stats = build_metadata_database(target, use_cache_dir)
+                    self._open_cache(meta_stats.db_path, target, use_cache_dir)
+                errors = []
+                subset = []
+                for name in signals:
+                    sig = self.get_signal(str(name), require_indexed=False)
+                    if isinstance(sig, dict):
+                        errors.append({"signal": name, "status": sig.get("status"), "summary": sig.get("summary"), "data": sig.get("data")})
+                    else:
+                        subset.append(sig.full_path)
+                if errors:
+                    return fail("bad_signals", "One or more signals to index could not be resolved", {"errors": errors})
             self.close()
-            stats = build_database(target, use_cache_dir, rebuild=rebuild, level=level)
+            stats = build_database(target, use_cache_dir, rebuild=rebuild, level=level, signals=subset)
             self._open_cache(stats.db_path, target, use_cache_dir)
             data = self._info_data()
             data.update({
@@ -286,7 +305,8 @@ class WaveQEngine:
                 "cache_reused": stats.reused,
                 "index_levels_ready": self._ready_levels(),
                 "query_ready": self._query_ready(),
-                "signal_subset_indexing": "unsupported",
+                "index_subset": stats.indexed_signals is not None,
+                "indexed_signal_count": stats.indexed_signals if stats.indexed_signals is not None else stats.signal_count,
                 "counts": {
                     "signals": stats.signal_count,
                     "changes": stats.change_count,
@@ -328,6 +348,8 @@ class WaveQEngine:
             "min_time": self.format_tick(int(self.meta.get("min_tick", 0))) if self.timescale else None,
             "max_time": self.format_tick(int(self.meta.get("max_tick", 0))) if self.timescale else None,
             "build_state": self.meta.get("build_state", "unknown"),
+            "index_subset": self._indexed is not None,
+            "indexed_signal_count": len(self._indexed) if self._indexed is not None else int(self.meta.get("signal_count", 0)),
             "index_levels_ready": self._ready_levels(),
             "query_ready": self._query_ready(),
             **size_data,
@@ -411,6 +433,7 @@ class WaveQEngine:
                     "width": int(r["width"]),
                     "score": round(min(score / 120.0, 1.0), 3),
                     "reason": reason,
+                    "indexed": self._indexed is None or int(r["signal_id"]) in self._indexed,
                 }
                 for score, reason, r in ranked
             ]
@@ -437,15 +460,32 @@ class WaveQEngine:
             ))
         return rows
 
-    def get_signal(self, name: str) -> SignalRef | dict[str, Any]:
+    def get_signal(self, name: str, *, require_indexed: bool = True) -> SignalRef | dict[str, Any]:
+        """Resolve a name to one signal. With a subset index, a signal outside it fails with
+        signal_not_indexed instead of reading as a signal that never changed."""
         key = name.strip().lower()
-        cached = self._sig_cache.get(key)
-        if cached is not None:
-            return cached
-        sig = self._lookup_signal(name)
-        if isinstance(sig, SignalRef):
+        sig = self._sig_cache.get(key)
+        if sig is None:
+            sig = self._lookup_signal(name)
+            if isinstance(sig, dict):
+                return sig
             self._sig_cache[key] = sig
+        if require_indexed and self._indexed is not None and sig.signal_id not in self._indexed:
+            return fail(
+                "signal_not_indexed",
+                f"{sig.full_path} is not in this cache's signal subset; call build_index with it in signals (the subset grows) or without signals for all",
+                {"signal": sig.full_path, "indexed_signal_count": len(self._indexed), "recommended_next_tool": "build_index"},
+            )
         return sig
+
+    def _only_indexed(self, sigs: list[SignalRef]) -> tuple[list[SignalRef], list[str]]:
+        """Drop signals outside a subset index; return the kept ones and a limitation line (if any)."""
+        if self._indexed is None:
+            return sigs, []
+        kept = [s for s in sigs if s.signal_id in self._indexed]
+        skipped = len(sigs) - len(kept)
+        note = [f"{skipped} signal(s) in range are not in this cache's signal subset and were not checked"] if skipped else []
+        return kept, note
 
     def _lookup_signal(self, name: str) -> SignalRef | dict[str, Any]:
         rows = self._get_signal_exact_rows(name)
@@ -1357,6 +1397,7 @@ class WaveQEngine:
             sigs = self._signals_in_scope(scope)
             if isinstance(sigs, dict):
                 return sigs
+            sigs, subset_note = self._only_indexed(sigs)
             # String values can contain the letters x/z; they are not 4-state unknowns.
             sigs = [s for s in sigs if s.kind.lower() not in {"string", "real", "realtime"}]
             held = self._held_rows([s.signal_id for s in sigs], tick)
@@ -1405,7 +1446,7 @@ class WaveQEngine:
                 "signals": entries[:limit],
                 "truncated": truncated,
             }
-            limitations = ["unknown_since is when the current unknown stretch began; unknown_since_start means unknown since time 0"]
+            limitations = ["unknown_since is when the current unknown stretch began; unknown_since_start means unknown since time 0", *subset_note]
             if truncated:
                 limitations.append("result truncated at limit")
             if not entries:
@@ -1440,8 +1481,9 @@ class WaveQEngine:
                 return sigs
             ignored_ids: set[int] = set()
             ignore_errors = []
+            sigs, subset_note = self._only_indexed(sigs)
             for name in ignore or []:
-                ref = self.get_signal(name)
+                ref = self.get_signal(name, require_indexed=False)
                 if isinstance(ref, dict):
                     ignore_errors.append({"signal": name, "status": ref.get("status"), "summary": ref.get("summary")})
                 else:
@@ -1492,7 +1534,7 @@ class WaveQEngine:
                 "idle": [{"signal": s.full_path, "end_value": end_value(s)} for s in idle[:limit]],
                 "truncated": len(active) > limit or len(idle) > limit,
             }
-            limitations = ["counts changes strictly after start and at or before end"]
+            limitations = ["counts changes strictly after start and at or before end", *subset_note]
             if data["truncated"]:
                 limitations.append("lists truncated at limit")
             if last_tick is None:
@@ -1808,7 +1850,9 @@ class WaveQEngine:
                 sel_a = [SignalRef.from_row(r) for r in self.require().execute("SELECT * FROM signals ORDER BY full_path")]
                 rows_b = {r["full_path"]: r for r in other.execute("SELECT * FROM signals")}
                 paths_b = set(rows_b)
+            # Presence is judged on every signal in A; comparison only on the ones A indexed.
             paths_a = {s.full_path for s in sel_a}
+            sel_a, subset_note = self._only_indexed(sel_a)
             only_a = sorted(paths_a - paths_b)
             only_b = sorted(paths_b - paths_a)
             common: list[tuple[SignalRef, int]] = []
@@ -1861,7 +1905,7 @@ class WaveQEngine:
                 "width_mismatch": width_mismatch[:20],
                 "context": None,
             }
-            limitations: list[str] = []
+            limitations: list[str] = list(subset_note)
             if max_a != max_b:
                 longer = "A" if max_a > max_b else "B"
                 limitations.append(f"run {longer} is longer (A ends at {self.format_tick(max_a)}, B at {self.format_tick(max_b)}); only the common range was compared")
