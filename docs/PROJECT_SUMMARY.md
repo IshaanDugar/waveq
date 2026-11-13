@@ -1,6 +1,6 @@
 # WaveQ: project summary
 
-WaveQ lets an AI agent ask exact questions about a digital simulation waveform (a `.vcd` or `.vcd.gz` file) instead of reading the raw dump. It is a local MCP server and a CLI, written in pure Python with no runtime dependencies, licensed AGPL-3.0-or-later (MIT up to commit bb239b3), by Ishaan Dugar.
+WaveQ lets an AI agent ask exact questions about a digital simulation waveform (a `.vcd` or `.vcd.gz` file) instead of reading the raw dump. It is a local MCP server and a CLI, written in pure Python with no runtime dependencies, licensed AGPL-3.0-or-later, by Ishaan Dugar.
 
 - Repository: https://github.com/IshaanDugar/waveq
 - Site: https://ishaandugar.github.io/waveq/

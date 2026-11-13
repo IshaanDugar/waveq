@@ -256,7 +256,7 @@ docs/install/    MCP client setup guides
 
 GNU Affero General Public License v3.0 or later — see [LICENSE](LICENSE).
 
-WaveQ is free for everyone to use, study, change and share. If you distribute a modified version, or run one as a service for others, you must publish your source under the same license. Versions up to and including commit `bb239b3` were released under the MIT license.
+WaveQ is free for everyone to use, study, change and share. If you distribute a modified version, or run one as a service for others, you must publish your source under the same license.
 
 Originally developed by Ishaan Dugar during an internship at Ambiq Micro. Ambiq Micro is not the author or maintainer of this project.
 
